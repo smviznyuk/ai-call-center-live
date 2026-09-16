@@ -1,3 +1,4 @@
+import { initDatabase } from './db.js';
 import Fastify from 'fastify';
 import WebSocket from 'ws';
 import dotenv from 'dotenv';
@@ -372,20 +373,21 @@ fastify.register(async (fastify) => {
     );
 });
 
-fastify.listen(
-    {
-        port: PORT,
-        host: '0.0.0.0'
-    },
-    (err) => {
+async function start() {
+    try {
+        await initDatabase();
 
-        if (err) {
-            console.error(err);
-            process.exit(1);
-        }
+        await fastify.listen({
+            port: PORT,
+            host: '0.0.0.0'
+        });
 
-        console.log(
-            `AI Call Center listening on port ${PORT}`
-        );
+        console.log(`AI Call Center listening on port ${PORT}`);
+
+    } catch (error) {
+        console.error('Startup error:', error);
+        process.exit(1);
     }
-);
+}
+
+start();
