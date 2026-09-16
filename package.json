@@ -10,6 +10,7 @@
         "start": "node live-demo.js"
     },
     "dependencies": {
+        "pg": "^8.16.3",
         "@fastify/formbody": "^8.0.1",
         "@fastify/websocket": "^11.0.1",
         "dotenv": "^16.4.5",
