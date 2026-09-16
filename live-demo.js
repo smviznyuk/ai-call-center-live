@@ -1,4 +1,8 @@
-import { initDatabase } from './db.js';
+import {
+    initDatabase,
+    findOrCreateCustomer,
+    createJobForCall
+} from './db.js';
 import Fastify from 'fastify';
 import WebSocket from 'ws';
 import dotenv from 'dotenv';
@@ -141,16 +145,35 @@ fastify.get('/', async () => ({
     message: 'AI Call Center is running!'
 }));
 
+function escapeXml(value = '') {
+    return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&apos;');
+}
+
 fastify.all('/incoming-call', async (request, reply) => {
     const host =
         request.headers['x-forwarded-host'] ||
         request.headers.host;
 
+    const callerPhone =
+        request.body?.From ||
+        request.query?.From ||
+        '';
+
     reply.type('text/xml').send(
         `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Connect>
-        <Stream url="wss://${host}/media-stream" />
+        <Stream url="wss://${host}/media-stream">
+            <Parameter
+                name="From"
+                value="${escapeXml(callerPhone)}"
+            />
+        </Stream>
     </Connect>
 </Response>`
     );
@@ -302,7 +325,7 @@ fastify.register(async (fastify) => {
                 }
             });
 
-            connection.on('message', (message) => {
+            connection.on('message', async (message) => {
 
                 try {
 
@@ -319,16 +342,52 @@ fastify.register(async (fastify) => {
                             audio: data.media.payload
                         });
 
-                    } else if (data.event === 'start') {
+                   } else if (data.event === 'start') {
 
                         streamSid = data.start.streamSid;
+
+                        const callSid = data.start.callSid;
+
+                        const callerPhone =
+                            data.start.customParameters?.From || null;
 
                         console.log(
                             'Incoming Twilio stream:',
                             streamSid
                         );
 
+                        // Mia starts talking immediately.
+                        // Database work happens without delaying the call.
                         startSession();
+
+                        try {
+                            if (!callerPhone) {
+                                console.error(
+                                    'Caller phone number was not received'
+                                );
+                            } else {
+                                const customer =
+                                    await findOrCreateCustomer(
+                                        callerPhone
+                                    );
+
+                            const job =
+                                await createJobForCall({
+                                    customerId: customer.id,
+                                    callSid
+                                });
+
+                            console.log(
+                                `CRM job created: #${job.job_number}`
+                            );
+                    }
+
+                } catch (error) {
+                    console.error(
+                        'CRM create job error:',
+                        error
+                    );
+                }
 
                     } else if (data.event === 'stop') {
 
