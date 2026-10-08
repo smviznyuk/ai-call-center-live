@@ -38,15 +38,21 @@ if (!OWNER_PHONE_NUMBER) {
 const MODEL = 'gpt-live-1';
 const ROUTER_MODEL = 'gpt-6-luna';
 const VOICE = 'marin';
-const USER_AGENT = 'sv-ai-call-center/2.0';
+const USER_AGENT = 'sv-ai-call-center/2.1';
 const PORT = process.env.PORT || 5050;
 
 const SILENCE_CHECK_MS = 25_000;
 const SILENCE_HANGUP_MS = 10_000;
 
+const SILENCE_PROMPT_TRANSCRIPT_QUIET_MS = 1_200;
+const SILENCE_PROMPT_FALLBACK_MS = 5_000;
+
 const MAX_AI_CALL_MS = 5 * 60_000;
-const MAX_CALL_WARNING_MS = 4 * 60_000 + 50_000;
-const MAX_CALL_CLOSING_MS = 4 * 60_000 + 56_000;
+const MAX_CALL_WARNING_MS =
+    4 * 60_000 + 50_000;
+
+const MAX_CALL_CLOSING_MS =
+    4 * 60_000 + 56_000;
 
 const OPENING =
     'Hi, this is Mia. How can I help you?';
@@ -93,7 +99,7 @@ handle the conversation directly and collect:
 
 CALLBACK NUMBER:
 - The backend already knows the incoming phone number.
-- Do not ask the caller to repeat the same number.
+- Never ask the caller to repeat the same number.
 - Ask:
   "Can we reach you back at this number?"
 - If they say no, then ask for the best callback number.
@@ -151,13 +157,13 @@ SEMANTIC DELEGATION:
 Use backend delegation based on the MEANING
 of the conversation, not keywords.
 
-Do not try to solve these decisions
-using exact phrases.
+Always delegate before taking or promising an action when:
 
-ALWAYS delegate before taking or promising an action when:
-
-- The caller wants a human, owner, manager,
-  technician, representative,
+- The caller wants a human,
+  owner,
+  manager,
+  technician,
+  representative,
   or otherwise wants to stop dealing
   with the virtual assistant.
 
@@ -179,7 +185,9 @@ ALWAYS delegate before taking or promising an action when:
   or asks for protected/internal information.
 
 - The caller says they have an existing
-  vendor, supplier, account,
+  vendor,
+  supplier,
+  account,
   or other business matter
   that may legitimately require a human.
 
@@ -192,10 +200,13 @@ ALWAYS delegate before taking or promising an action when:
 
 - The caller has an unusual or unclear intent
   where you need help deciding whether
-  to continue, clarify, transfer, or end.
+  to continue,
+  clarify,
+  transfer,
+  or end.
 
 For ordinary HVAC/plumbing service intake,
-do NOT delegate just because the customer
+do not delegate just because the customer
 asks a normal service question.
 
 IMPORTANT:
@@ -258,12 +269,12 @@ Normal HVAC/plumbing customer service request
 or routine service question.
 
 existing_customer_issue:
-Caller is discussing prior service,
+Prior service,
 rework,
 warranty,
 billing,
 payment,
-or an existing customer problem.
+or existing customer problem.
 
 existing_business_matter:
 Legitimate vendor,
@@ -273,7 +284,7 @@ property manager,
 partner,
 delivery,
 invoice,
-or existing company/account matter.
+or account matter.
 
 human_transfer_request:
 Caller wants to speak with a human
@@ -401,12 +412,10 @@ Never invent facts.
 
 Keep user_message short and natural.
 
-
 For transfer_to_human,
 user_message should normally be:
 
 "Sure, I'll try to connect you now."
-
 
 For unsolicited sales,
 user_message should be
@@ -516,7 +525,6 @@ fastify.register(
     fastifyWs
 );
 
-
 const acceptedTransfers =
     new Set();
 
@@ -535,27 +543,22 @@ function escapeXml(
 ) {
 
     return String(value)
-
         .replace(
             /&/g,
             '&amp;'
         )
-
         .replace(
             /</g,
             '&lt;'
         )
-
         .replace(
             />/g,
             '&gt;'
         )
-
         .replace(
             /"/g,
             '&quot;'
         )
-
         .replace(
             /'/g,
             '&apos;'
@@ -573,17 +576,13 @@ function getPublicBaseUrl(
         ] ||
         'https';
 
-
     const host =
         request.headers[
             'x-forwarded-host'
         ] ||
         request.headers.host;
 
-
-    return (
-        `${proto}://${host}`
-    );
+    return `${proto}://${host}`;
 }
 
 
@@ -668,7 +667,6 @@ async function routeCallIntent(
 
         const body =
             await response.text();
-
 
         throw new Error(
             `Router API ${response.status}: ${body}`
@@ -778,7 +776,9 @@ fastify.all(
             .send(
 `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
+
     <Connect>
+
         <Stream url="${escapeXml(wsBaseUrl)}/media-stream">
 
             <Parameter
@@ -797,7 +797,9 @@ fastify.all(
             />
 
         </Stream>
+
     </Connect>
+
 </Response>`
             );
     }
@@ -1160,7 +1162,7 @@ fastify.register(
 
 
                 // --------------------------------------
-                // TRANSCRIPT / ROUTING CONTEXT
+                // TRANSCRIPT / ROUTER CONTEXT
                 // --------------------------------------
 
                 let transcriptBuffer =
@@ -1183,18 +1185,22 @@ fastify.register(
 
 
                 // --------------------------------------
-                // ACTIVITY / SILENCE
+                // TRANSCRIPT ACTIVITY
                 // --------------------------------------
-
-                let lastCustomerSpeechAt =
-                    Date.now();
-
-                let lastAssistantAudioAt =
-                    Date.now();
 
                 let sessionReadyAt =
                     Date.now();
 
+                let lastCustomerTranscriptAt =
+                    Date.now();
+
+                let lastAssistantTranscriptAt =
+                    Date.now();
+
+
+                // --------------------------------------
+                // SILENCE STATE
+                // --------------------------------------
 
                 let silencePhase =
                     'normal';
@@ -1202,10 +1208,10 @@ fastify.register(
                 let silencePromptSentAt =
                     0;
 
-                let silencePromptAudioSeen =
+                let silencePromptTranscriptSeen =
                     false;
 
-                let silencePromptLastAudioAt =
+                let silencePromptLastTranscriptAt =
                     0;
 
                 let silenceWaitStartedAt =
@@ -1215,6 +1221,9 @@ fastify.register(
                 // --------------------------------------
                 // END CALL STATE
                 // --------------------------------------
+
+                let lastAssistantAudioAt =
+                    Date.now();
 
                 let pendingEnd =
                     null;
@@ -1246,6 +1255,7 @@ fastify.register(
 
                 const openAiWs =
                     new WebSocket(
+
                         'wss://api.openai.com/v1/live/sessions',
 
                         {
@@ -1573,7 +1583,7 @@ fastify.register(
                             streamSid &&
 
                             connection.readyState ===
-                            WebSocket.OPEN
+                                WebSocket.OPEN
                         ) {
 
                             sendToTwilio({
@@ -1820,7 +1830,7 @@ fastify.register(
 
 
                 // --------------------------------------
-                // WAIT FOR MIA SPEECH
+                // WAIT FOR SHORT MIA CLOSING
                 // --------------------------------------
 
                 const waitForAssistantSpeechToFinish =
@@ -2135,7 +2145,7 @@ ${
 
 
                 // --------------------------------------
-                // HANDLE GPT-LIVE DELEGATION
+                // SEMANTIC DELEGATION
                 // --------------------------------------
 
                 const handleDelegation =
@@ -2159,9 +2169,6 @@ ${
                             delegationId
                         );
 
-
-                        // Transcript fragments may arrive
-                        // slightly after the delegation event.
 
                         await sleep(
                             250
@@ -2214,8 +2221,6 @@ ${
                         );
 
 
-                        // CONTINUE
-
                         if (
                             decision.action ===
                             'continue'
@@ -2237,8 +2242,6 @@ ${
                             return;
                         }
 
-
-                        // CLARIFY
 
                         if (
                             decision.action ===
@@ -2263,8 +2266,6 @@ ${
                             return;
                         }
 
-
-                        // TRANSFER
 
                         if (
                             decision.action ===
@@ -2307,8 +2308,6 @@ ${
                         }
 
 
-                        // SALES / SCAM / WRONG NUMBER
-
                         if (
                             decision.action ===
                             'decline_and_end'
@@ -2342,8 +2341,6 @@ ${
                         }
 
 
-                        // NORMAL CONVERSATION END
-
                         if (
                             decision.action ===
                             'end_call'
@@ -2366,8 +2363,44 @@ ${
 
 
                 // --------------------------------------
-                // SILENCE HANDLING
+                // SILENCE STATE
                 // --------------------------------------
+
+                const resetSilenceState =
+                    (
+                        reason =
+                            null
+                    ) => {
+
+                        if (
+                            silencePhase !==
+                                'normal' &&
+
+                            reason
+                        ) {
+
+                            console.log(
+                                reason
+                            );
+                        }
+
+
+                        silencePhase =
+                            'normal';
+
+                        silencePromptSentAt =
+                            0;
+
+                        silencePromptTranscriptSeen =
+                            false;
+
+                        silencePromptLastTranscriptAt =
+                            0;
+
+                        silenceWaitStartedAt =
+                            0;
+                    };
+
 
                 const startSilencePrompt =
                     () => {
@@ -2389,16 +2422,21 @@ ${
                             Date.now();
 
 
-                        silencePromptAudioSeen =
+                        silencePromptTranscriptSeen =
                             false;
 
 
-                        silencePromptLastAudioAt =
+                        silencePromptLastTranscriptAt =
                             0;
 
 
                         console.log(
                             '25 seconds of customer silence'
+                        );
+
+
+                        console.log(
+                            'Silence check sent'
                         );
 
 
@@ -2451,7 +2489,7 @@ ${
 
 
                 // --------------------------------------
-                // SILENCE + 5 MINUTE TIMERS
+                // TIMERS
                 // --------------------------------------
 
                 function scheduleAiTimers() {
@@ -2483,7 +2521,7 @@ ${
                         elapsed;
 
 
-                    // 4:50 WARNING
+                    // 4:50
 
                     if (
                         warningDelay >
@@ -2525,7 +2563,7 @@ ${
                     }
 
 
-                    // 4:56 CLOSING
+                    // 4:56
 
                     if (
                         closingDelay >
@@ -2566,7 +2604,7 @@ ${
                     }
 
 
-                    // HARD 5:00 LIMIT
+                    // HARD 5:00
 
                     if (
                         hardDelay <=
@@ -2596,7 +2634,7 @@ ${
                         );
 
 
-                    // SILENCE MONITOR
+                    // SILENCE
 
                     silenceMonitor =
                         setInterval(
@@ -2620,10 +2658,10 @@ ${
                                     Date.now();
 
 
-                                // --------------------------
-                                // WAIT FOR "ARE YOU THERE?"
-                                // TO FINISH
-                                // --------------------------
+                                // ----------------------
+                                // MIA IS SAYING:
+                                // "ARE YOU STILL THERE?"
+                                // ----------------------
 
                                 if (
                                     silencePhase ===
@@ -2631,15 +2669,11 @@ ${
                                 ) {
 
                                     if (
-                                        lastCustomerSpeechAt >
+                                        lastCustomerTranscriptAt >
                                         silencePromptSentAt
                                     ) {
 
-                                        silencePhase =
-                                            'normal';
-
-
-                                        console.log(
+                                        resetSilenceState(
                                             'Customer returned after silence check'
                                         );
 
@@ -2649,11 +2683,11 @@ ${
 
 
                                     if (
-                                        silencePromptAudioSeen &&
+                                        silencePromptTranscriptSeen &&
 
                                         now -
-                                            silencePromptLastAudioAt >=
-                                            1000
+                                            silencePromptLastTranscriptAt >=
+                                            SILENCE_PROMPT_TRANSCRIPT_QUIET_MS
                                     ) {
 
                                         silencePhase =
@@ -2665,7 +2699,12 @@ ${
 
 
                                         console.log(
-                                            'Silence check finished; waiting 10 seconds'
+                                            'Silence check finished'
+                                        );
+
+
+                                        console.log(
+                                            'Silence timer started: 10 seconds'
                                         );
 
 
@@ -2673,13 +2712,13 @@ ${
                                     }
 
 
-                                    // Fallback if audio tracking
-                                    // fails for any reason.
+                                    // Hard fallback if transcript
+                                    // for the system prompt never arrives.
 
                                     if (
                                         now -
                                             silencePromptSentAt >=
-                                        5000
+                                        SILENCE_PROMPT_FALLBACK_MS
                                     ) {
 
                                         silencePhase =
@@ -2691,7 +2730,12 @@ ${
 
 
                                         console.log(
-                                            'Silence check audio fallback; waiting 10 seconds'
+                                            'Silence check transcript fallback; waiting 10 seconds'
+                                        );
+
+
+                                        console.log(
+                                            'Silence timer started: 10 seconds'
                                         );
                                     }
 
@@ -2700,9 +2744,9 @@ ${
                                 }
 
 
-                                // --------------------------
-                                // SECOND 10-SECOND WINDOW
-                                // --------------------------
+                                // ----------------------
+                                // WAIT SECOND 10 SECONDS
+                                // ----------------------
 
                                 if (
                                     silencePhase ===
@@ -2710,15 +2754,11 @@ ${
                                 ) {
 
                                     if (
-                                        lastCustomerSpeechAt >
+                                        lastCustomerTranscriptAt >
                                         silenceWaitStartedAt
                                     ) {
 
-                                        silencePhase =
-                                            'normal';
-
-
-                                        console.log(
+                                        resetSilenceState(
                                             'Customer returned after silence check'
                                         );
 
@@ -2750,16 +2790,16 @@ ${
                                 }
 
 
-                                // --------------------------
-                                // FIRST 25-SECOND WINDOW
-                                // --------------------------
+                                // ----------------------
+                                // NORMAL 25 SECOND TIMER
+                                // ----------------------
 
-                                const activityReference =
+                                const transcriptActivityAt =
                                     Math.max(
 
-                                        lastCustomerSpeechAt,
+                                        lastCustomerTranscriptAt,
 
-                                        lastAssistantAudioAt,
+                                        lastAssistantTranscriptAt,
 
                                         sessionReadyAt
                                     );
@@ -2767,22 +2807,27 @@ ${
 
                                 if (
                                     now -
-                                        activityReference >=
+                                        transcriptActivityAt >=
                                     SILENCE_CHECK_MS
                                 ) {
+
+                                    console.log(
+                                        'Silence timer reached 25 seconds'
+                                    );
+
 
                                     startSilencePrompt();
                                 }
 
                             },
 
-                            500
+                            250
                         );
                 }
 
 
                 // --------------------------------------
-                // START GPT-LIVE
+                // START LIVE SESSION
                 // --------------------------------------
 
                 const startSession =
@@ -2899,11 +2944,11 @@ ${
                                     Date.now();
 
 
-                                lastCustomerSpeechAt =
+                                lastCustomerTranscriptAt =
                                     sessionReadyAt;
 
 
-                                lastAssistantAudioAt =
+                                lastAssistantTranscriptAt =
                                     sessionReadyAt;
 
 
@@ -2953,6 +2998,11 @@ ${
                                 });
 
 
+                                console.log(
+                                    'Silence timer armed after conversation activity'
+                                );
+
+
                                 scheduleAiTimers();
 
 
@@ -2974,20 +3024,6 @@ ${
 
                                 lastAssistantAudioAt =
                                     Date.now();
-
-
-                                if (
-                                    silencePhase ===
-                                    'prompting'
-                                ) {
-
-                                    silencePromptAudioSeen =
-                                        true;
-
-
-                                    silencePromptLastAudioAt =
-                                        lastAssistantAudioAt;
-                                }
 
 
                                 sendToTwilio({
@@ -3013,7 +3049,7 @@ ${
 
                             if (
                                 event.type ===
-                                'session.input_transcript.delta'
+                                    'session.input_transcript.delta'
                             ) {
 
                                 console.log(
@@ -3022,7 +3058,7 @@ ${
                                 );
 
 
-                                lastCustomerSpeechAt =
+                                lastCustomerTranscriptAt =
                                     Date.now();
 
 
@@ -3034,11 +3070,7 @@ ${
                                     'normal'
                                 ) {
 
-                                    silencePhase =
-                                        'normal';
-
-
-                                    console.log(
+                                    resetSilenceState(
                                         'Customer returned after silence check'
                                     );
                                 }
@@ -3077,13 +3109,34 @@ ${
 
                             if (
                                 event.type ===
-                                'session.output_transcript.delta'
+                                    'session.output_transcript.delta'
                             ) {
 
                                 console.log(
                                     'Assistant:',
                                     event.delta
                                 );
+
+
+                                lastAssistantTranscriptAt =
+                                    Date.now();
+
+
+                                if (
+                                    silencePhase ===
+                                        'prompting' &&
+
+                                    lastAssistantTranscriptAt >=
+                                        silencePromptSentAt
+                                ) {
+
+                                    silencePromptTranscriptSeen =
+                                        true;
+
+
+                                    silencePromptLastTranscriptAt =
+                                        lastAssistantTranscriptAt;
+                                }
 
 
                                 queueTranscript(
@@ -3119,7 +3172,7 @@ ${
 
                             if (
                                 event.type ===
-                                'session.delegation.created'
+                                    'session.delegation.created'
                             ) {
 
                                 const delegationId =
@@ -3175,7 +3228,7 @@ ${
 
                             if (
                                 event.type ===
-                                'error'
+                                    'error'
                             ) {
 
                                 console.error(
@@ -3247,7 +3300,7 @@ ${
 
                             if (
                                 data.event ===
-                                'start'
+                                    'start'
                             ) {
 
                                 streamSid =
@@ -3386,7 +3439,7 @@ ${
 
                             if (
                                 data.event ===
-                                'stop'
+                                    'stop'
                             ) {
 
                                 await shutdown(
