@@ -16,7 +16,8 @@ dotenv.config();
 const {
     OPENAI_API_KEY,
     TWILIO_ACCOUNT_SID,
-    TWILIO_AUTH_TOKEN
+    TWILIO_AUTH_TOKEN,
+    OWNER_PHONE_NUMBER
 } = process.env;
 
 if (!OPENAI_API_KEY) {
@@ -29,12 +30,25 @@ if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
     process.exit(1);
 }
 
+if (!OWNER_PHONE_NUMBER) {
+    console.error('Missing OWNER_PHONE_NUMBER.');
+    process.exit(1);
+}
+
 const MODEL = 'gpt-live-1';
 const VOICE = 'marin';
 const USER_AGENT = 'sv-ai-call-center/1.0';
 const PORT = process.env.PORT || 5050;
 
-const OPENING = 'Hi, this is Mia. How can I help you?';
+const SILENCE_CHECK_MS = 25_000;
+const SILENCE_HANGUP_MS = 10_000;
+
+const MAX_AI_CALL_MS = 5 * 60_000;
+const MAX_CALL_WARNING_MS = 4 * 60_000 + 50_000;
+const MAX_CALL_CLOSING_MS = 4 * 60_000 + 56_000;
+
+const OPENING =
+    'Hi, this is Mia. How can I help you?';
 
 const VOICE_PROMPT = `
 You are Mia, the female phone receptionist for an HVAC and plumbing service company
@@ -81,9 +95,20 @@ COLLECT:
 - Service address and ZIP code.
 - Preferred appointment time.
 - Whether the issue is urgent.
+- Confirm whether we can contact the customer at the number they are calling from.
+
+CALLBACK NUMBER:
+- The backend already knows the phone number the customer is calling from.
+- Never ask the customer to repeat that same number.
+- Ask naturally:
+  "Can we reach you back at this number?"
+- If the customer says yes, do not ask for the number.
+- If the customer says no, ask:
+  "What's the best number to reach you at?"
 
 HVAC:
 Ask only useful questions based on the customer's problem.
+
 Examples:
 - Is the system not cooling, not heating, leaking, frozen, making noise, or not turning on?
 - Is it central AC, mini-split, furnace, boiler, or another system?
@@ -93,6 +118,7 @@ Do not perform a long technical diagnosis over the phone.
 
 PLUMBING:
 Briefly determine what is leaking, clogged, broken, or not working.
+
 If water is actively leaking, ask whether they can safely shut off the water.
 
 NO EXTERNAL LOOKUPS:
@@ -105,7 +131,7 @@ NO EXTERNAL LOOKUPS:
 - If a fact is not confirmed, say briefly that you do not have confirmed information.
 - Do not delegate a request merely because you do not know the answer.
 
-For example, if asked what faucet brands the company carries, say briefly:
+For example, if asked what faucet brands the company carries, say:
 
 "I don't have a confirmed inventory list, so I don't want to give you the wrong information. Is there a particular brand you're looking for?"
 
@@ -117,33 +143,54 @@ PRICING:
 - If the technician performs the repair or service work, the $95 service call goes toward the cost of the work.
 - If no repair or service work is performed, the $95 service call still applies.
 
-If asked how much a repair will cost, say briefly:
+If asked how much a repair will cost, say:
 
 "I can't give you an exact repair price until the technician checks it. The service call is $95, and if we do the repair, that $95 goes toward the cost of the work."
 
-Near the end of the conversation, after you understand the problem, address,
-and preferred appointment time, mention the $95 service call once if it has not already been discussed.
+Near the end of the conversation, after you understand the problem,
+address, and preferred appointment time, mention the $95 service call once
+if it has not already been discussed.
 
 SCHEDULING:
 - Do not guarantee an appointment time unless availability has been confirmed.
 - For now, collect the customer's preferred time and say it will be confirmed.
-- Never claim a text, appointment confirmation, or other action was sent unless the backend has actually confirmed it.
+- Never claim a text, appointment confirmation, or other action was sent
+  unless the backend has actually confirmed it.
+
+HUMAN TRANSFER:
+- If the caller asks to speak to a person, owner, manager, technician,
+  representative, or human, agree briefly and say you will try to connect them.
+- If the caller is upset, has a complaint or dispute, asks for a decision
+  you cannot make, or the situation is outside the confirmed information you have,
+  offer:
+  "Would you like me to connect you with someone?"
+- If you cannot understand the customer's request after two reasonable attempts,
+  offer the same transfer.
+- Do not say that the transfer succeeded until it actually succeeds.
+- Do not keep asking questions after the customer clearly requests a person.
 
 SAFETY:
 If there is a gas smell, fire, smoke, carbon monoxide alarm, or immediate danger,
 tell the customer to leave the area and contact 911 or the appropriate utility.
 
+A transfer to the company must never replace emergency services.
+
 ENDING:
-- Before ending the call, try to have the customer's name, service issue, address, and preferred time.
+- Before ending the call, try to have the customer's name,
+  service issue, address, preferred time, and callback-number confirmation.
 - Do not give a long recap.
-- If the caller clearly says goodbye, says that is all, or otherwise clearly ends the conversation, give one brief natural closing sentence.
-- After a clear goodbye, do not ask another question and do not continue the conversation.
+- If the caller clearly says goodbye, says that is all,
+  or otherwise clearly ends the conversation,
+  give one brief natural closing sentence.
+- After a clear goodbye, do not ask another question.
 `;
 
 const fastify = Fastify();
 
 fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
+
+const acceptedTransfers = new Set();
 
 fastify.get('/', async () => ({
     message: 'AI Call Center is running!'
@@ -167,8 +214,21 @@ function normalizeForMatch(value = '') {
         .trim();
 }
 
+function getPublicBaseUrl(request) {
+    const proto =
+        request.headers['x-forwarded-proto'] ||
+        'https';
+
+    const host =
+        request.headers['x-forwarded-host'] ||
+        request.headers.host;
+
+    return `${proto}://${host}`;
+}
+
 function containsExplicitGoodbye(value = '') {
-    const text = normalizeForMatch(value);
+    const text =
+        normalizeForMatch(value);
 
     return (
         /(^|\s)(bye|goodbye|good bye|that's all|that is all|thanks bye|thank you bye|thanks goodbye|thank you goodbye)(\s|$)/i.test(text) ||
@@ -176,523 +236,1066 @@ function containsExplicitGoodbye(value = '') {
     );
 }
 
-fastify.all('/incoming-call', async (request, reply) => {
+function containsExplicitHumanRequest(value = '') {
+    const text =
+        normalizeForMatch(value);
 
-    const host =
-        request.headers['x-forwarded-host'] ||
-        request.headers.host;
+    return (
+        /\b(speak|talk|connect|transfer)\b.*\b(person|human|representative|manager|owner|technician|someone)\b/i.test(text) ||
+        /\b(i want|i need|can i get)\b.*\b(human|person|representative|manager|owner|technician)\b/i.test(text) ||
+        /\b(real person|live person|human agent)\b/i.test(text) ||
+        /(соедините|переведите|хочу поговорить|можно поговорить).*(человек|оператор|менеджер|владелец|техник|мастер)/i.test(text) ||
+        /(живой человек|живым человеком|оператором|менеджером|владельцем|техником|мастером)/i.test(text)
+    );
+}
 
-    const callerPhone =
-        request.body?.From ||
-        request.query?.From ||
-        '';
+function containsAffirmative(value = '') {
+    const text =
+        normalizeForMatch(value);
 
-    reply.type('text/xml').send(
+    return (
+        /\b(yes|yeah|yep|sure|okay|ok|please|go ahead|absolutely)\b/i.test(text) ||
+        /\b(да|ага|конечно|давайте|хорошо|пожалуйста)\b/i.test(text)
+    );
+}
+
+function containsNegative(value = '') {
+    const text =
+        normalizeForMatch(value);
+
+    return (
+        /\b(no|nope|not now)\b/i.test(text) ||
+        /\b(нет|не надо|не нужно)\b/i.test(text)
+    );
+}
+
+
+// ======================================================
+// INCOMING CALL
+// ======================================================
+
+fastify.all(
+    '/incoming-call',
+
+    async (request, reply) => {
+
+        const baseUrl =
+            getPublicBaseUrl(request);
+
+        const callerPhone =
+            request.body?.From ||
+            request.query?.From ||
+            '';
+
+        const callStartMs =
+            Date.now();
+
+        const wsBaseUrl =
+            baseUrl.replace(
+                /^http/,
+                'ws'
+            );
+
+        reply
+            .type('text/xml')
+            .send(
 `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Connect>
-        <Stream url="wss://${host}/media-stream">
+        <Stream url="${escapeXml(wsBaseUrl)}/media-stream">
             <Parameter
                 name="From"
                 value="${escapeXml(callerPhone)}"
             />
+            <Parameter
+                name="BaseUrl"
+                value="${escapeXml(baseUrl)}"
+            />
+            <Parameter
+                name="CallStartMs"
+                value="${callStartMs}"
+            />
         </Stream>
     </Connect>
 </Response>`
-    );
-});
+            );
+    }
+);
 
-fastify.register(async (fastify) => {
 
-    fastify.get(
-        '/media-stream',
-        { websocket: true },
+// ======================================================
+// OWNER CALL SCREENING
+// ======================================================
 
-        (connection) => {
+fastify.all(
+    '/owner-screen',
 
-            console.log('Twilio connected');
+    async (request, reply) => {
 
-            let streamSid = null;
-            let currentCallSid = null;
-            let currentJobNumber = null;
-            let openAiSessionId = null;
+        const baseUrl =
+            getPublicBaseUrl(request);
 
-            let sessionRequested = false;
-            let sessionReady = false;
-            let shuttingDown = false;
-            let twilioHangupRequested = false;
+        const parentCallSid =
+            request.query?.parent ||
+            request.body?.parent ||
+            '';
 
-            let transcriptBuffer = [];
-            let transcriptSaveChain = Promise.resolve();
+        const actionUrl =
+            `${baseUrl}/owner-screen-result?parent=${encodeURIComponent(parentCallSid)}`;
 
-            let customerTextWindow = '';
-            let assistantTextWindow = '';
+        reply
+            .type('text/xml')
+            .send(
+`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Gather
+        input="dtmf"
+        numDigits="1"
+        timeout="7"
+        action="${escapeXml(actionUrl)}"
+        method="POST">
+        <Say>
+            Service call transfer from Mia.
+            Press 1 to accept.
+        </Say>
+    </Gather>
 
-            let customerRequestedEnd = false;
-            let assistantSpokeAfterEnd = false;
+    <Say>
+        Transfer not accepted. Goodbye.
+    </Say>
 
-            let lastAssistantAudioAt = 0;
+    <Hangup/>
+</Response>`
+            );
+    }
+);
 
-            let gracefulEndTimer = null;
-            let gracefulEndFallbackTimer = null;
 
-            const openAiWs = new WebSocket(
-                'wss://api.openai.com/v1/live/sessions',
-                {
-                    headers: {
-                        Authorization:
-                            `Bearer ${OPENAI_API_KEY}`,
+fastify.all(
+    '/owner-screen-result',
 
-                        'User-Agent':
-                            USER_AGENT
-                    }
-                }
+    async (request, reply) => {
+
+        const digits =
+            request.body?.Digits ||
+            request.query?.Digits ||
+            '';
+
+        const parentCallSid =
+            request.query?.parent ||
+            request.body?.parent ||
+            '';
+
+        if (
+            digits === '1' &&
+            parentCallSid
+        ) {
+
+            acceptedTransfers.add(
+                parentCallSid
             );
 
-            const send = (event) => {
+            console.log(
+                `Owner accepted transfer for ${parentCallSid}`
+            );
 
-                if (
-                    openAiWs.readyState ===
-                    WebSocket.OPEN
-                ) {
-
-                    openAiWs.send(
-                        JSON.stringify(event)
-                    );
-                }
-            };
-
-            const queueTranscript = (
-                speaker,
-                text,
-                startMs = null,
-                endMs = null,
-                eventId = null
-            ) => {
-
-                if (
-                    typeof text !== 'string' ||
-                    text.length === 0
-                ) {
-                    return;
-                }
-
-                transcriptBuffer.push({
-                    speaker,
-                    text,
-                    startMs,
-                    endMs,
-                    eventId,
-                    sessionId:
-                        openAiSessionId
-                });
-            };
-
-            const flushTranscript = () => {
-
-                if (
-                    !currentJobNumber ||
-                    transcriptBuffer.length === 0
-                ) {
-
-                    return transcriptSaveChain;
-                }
-
-                const jobNumber =
-                    currentJobNumber;
-
-                const chunks =
-                    transcriptBuffer;
-
-                transcriptBuffer = [];
-
-                transcriptSaveChain =
-                    transcriptSaveChain
-
-                        .then(async () => {
-
-                            await saveTranscriptChunks(
-                                jobNumber,
-                                chunks
-                            );
-
-                            console.log(
-                                `Transcript saved: Job #${jobNumber}, ${chunks.length} chunks`
-                            );
-                        })
-
-                        .catch((error) => {
-
-                            console.error(
-                                'Transcript save error:',
-                                error
-                            );
-
-                            transcriptBuffer = [
-                                ...chunks,
-                                ...transcriptBuffer
-                            ];
-                        });
-
-                return transcriptSaveChain;
-            };
-
-            const transcriptTimer =
-                setInterval(
-                    () => {
-                        void flushTranscript();
-                    },
-                    1000
+            reply
+                .type('text/xml')
+                .send(
+`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say>
+        Connecting you now.
+    </Say>
+</Response>`
                 );
 
-            const closeSockets = () => {
+            return;
+        }
 
-                if (
-                    connection.readyState ===
-                    WebSocket.OPEN
-                ) {
+        reply
+            .type('text/xml')
+            .send(
+`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say>
+        Transfer declined. Goodbye.
+    </Say>
+    <Hangup/>
+</Response>`
+            );
+    }
+);
 
-                    connection.close();
-                }
 
-                if (
-                    openAiWs.readyState ===
-                    WebSocket.OPEN
-                ) {
+// ======================================================
+// TRANSFER RESULT
+// ======================================================
 
-                    openAiWs.close();
-                }
-            };
+fastify.all(
+    '/transfer-result',
 
-            const shutdown = async (
-                reason,
-                waitForFinalTranscript = false
-            ) => {
+    async (request, reply) => {
 
-                if (shuttingDown) {
-                    return;
-                }
+        const baseUrl =
+            getPublicBaseUrl(request);
 
-                shuttingDown = true;
+        const dialCallStatus =
+            request.body?.DialCallStatus ||
+            request.query?.DialCallStatus ||
+            '';
 
-                clearInterval(
-                    transcriptTimer
+        const callSid =
+            request.body?.CallSid ||
+            request.query?.CallSid ||
+            '';
+
+        const callerPhone =
+            request.body?.From ||
+            request.query?.From ||
+            '';
+
+        const startedRaw =
+            request.query?.started ||
+            request.body?.started ||
+            '';
+
+        const callStartMs =
+            Number(startedRaw) ||
+            Date.now();
+
+        const ownerAccepted =
+            callSid &&
+            acceptedTransfers.has(
+                callSid
+            );
+
+        console.log(
+            `Transfer result: ${dialCallStatus || 'unknown'}, accepted=${ownerAccepted}`
+        );
+
+        if (ownerAccepted) {
+
+            acceptedTransfers.delete(
+                callSid
+            );
+        }
+
+        if (
+            ownerAccepted &&
+            (
+                dialCallStatus ===
+                    'completed' ||
+                dialCallStatus ===
+                    'answered'
+            )
+        ) {
+
+            reply
+                .type('text/xml')
+                .send(
+`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Hangup/>
+</Response>`
                 );
 
-                if (gracefulEndTimer) {
+            return;
+        }
 
-                    clearInterval(
-                        gracefulEndTimer
-                    );
+        const wsBaseUrl =
+            baseUrl.replace(
+                /^http/,
+                'ws'
+            );
 
-                    gracefulEndTimer = null;
-                }
+        reply
+            .type('text/xml')
+            .send(
+`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
 
-                if (
-                    gracefulEndFallbackTimer
-                ) {
+    <Say>
+        Sorry, no one is available right now.
+        I'll reconnect you with Mia.
+    </Say>
 
-                    clearTimeout(
-                        gracefulEndFallbackTimer
-                    );
+    <Connect>
+        <Stream url="${escapeXml(wsBaseUrl)}/media-stream">
 
-                    gracefulEndFallbackTimer =
-                        null;
-                }
+            <Parameter
+                name="From"
+                value="${escapeXml(callerPhone)}"
+            />
 
-                if (
-                    waitForFinalTranscript &&
-                    openAiWs.readyState ===
-                        WebSocket.OPEN
-                ) {
+            <Parameter
+                name="BaseUrl"
+                value="${escapeXml(baseUrl)}"
+            />
 
-                    await new Promise(
-                        (resolve) =>
-                            setTimeout(
-                                resolve,
-                                500
-                            )
-                    );
-                }
+            <Parameter
+                name="CallStartMs"
+                value="${callStartMs}"
+            />
 
-                await flushTranscript();
+            <Parameter
+                name="ResumeReason"
+                value="transfer-unavailable"
+            />
 
-                await transcriptSaveChain;
+        </Stream>
+    </Connect>
+
+</Response>`
+            );
+    }
+);
+
+
+// ======================================================
+// MEDIA STREAM
+// ======================================================
+
+fastify.register(
+    async (fastify) => {
+
+        fastify.get(
+            '/media-stream',
+
+            {
+                websocket: true
+            },
+
+            (connection) => {
 
                 console.log(
-                    `Closing call resources: ${reason}`
+                    'Twilio connected'
                 );
 
-                closeSockets();
-            };
 
-            const endTwilioCall = async (
-                reason = 'conversation-ended'
-            ) => {
+                // --------------------------------------
+                // CALL STATE
+                // --------------------------------------
 
-                if (
-                    twilioHangupRequested ||
-                    !currentCallSid
-                ) {
+                let streamSid =
+                    null;
 
-                    return;
-                }
+                let currentCallSid =
+                    null;
 
-                twilioHangupRequested = true;
+                let currentJobNumber =
+                    null;
 
-                try {
+                let openAiSessionId =
+                    null;
 
-                    const auth =
-                        Buffer.from(
-                            `${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`
-                        ).toString(
-                            'base64'
-                        );
+                let currentPublicBaseUrl =
+                    null;
 
-                    const body =
-                        new URLSearchParams({
-                            Status:
-                                'completed'
-                        });
-
-                    const response =
-                        await fetch(
-                            `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Calls/${encodeURIComponent(currentCallSid)}.json`,
-                            {
-                                method:
-                                    'POST',
-
-                                headers: {
-                                    Authorization:
-                                        `Basic ${auth}`,
-
-                                    'Content-Type':
-                                        'application/x-www-form-urlencoded'
-                                },
-
-                                body
-                            }
-                        );
-
-                    if (!response.ok) {
-
-                        const responseText =
-                            await response.text();
-
-                        throw new Error(
-                            `Twilio ${response.status}: ${responseText}`
-                        );
-                    }
-
-                    console.log(
-                        `Twilio call ended: ${currentCallSid} (${reason})`
-                    );
-
-                    setTimeout(
-                        () => {
-
-                            void shutdown(
-                                'twilio-api-end',
-                                true
-                            );
-                        },
-                        800
-                    );
-
-                } catch (error) {
-
-                    twilioHangupRequested =
-                        false;
-
-                    console.error(
-                        'Twilio end call error:',
-                        error
-                    );
-                }
-            };
-
-            const requestGracefulEnd = () => {
-
-                if (
-                    customerRequestedEnd
-                ) {
-
-                    return;
-                }
-
-                customerRequestedEnd = true;
-
-                assistantSpokeAfterEnd =
+                let sessionRequested =
                     false;
 
-                assistantTextWindow =
+                let sessionReady =
+                    false;
+
+                let shuttingDown =
+                    false;
+
+                let twilioHangupRequested =
+                    false;
+
+                let transferInProgress =
+                    false;
+
+                let callStartMs =
+                    Date.now();
+
+                let resumeReason =
+                    null;
+
+
+                // --------------------------------------
+                // TRANSCRIPT STATE
+                // --------------------------------------
+
+                let transcriptBuffer =
+                    [];
+
+                let transcriptSaveChain =
+                    Promise.resolve();
+
+                let customerTextWindow =
                     '';
 
-                console.log(
-                    'Customer clearly ended the conversation'
-                );
+                let assistantTextWindow =
+                    '';
 
-                send({
-                    type:
-                        'session.instructions.append',
+                let customerRequestedEnd =
+                    false;
 
-                    delegation_id:
-                        null,
+                let assistantOfferedTransferUntil =
+                    0;
 
-                    content:
-                        'The caller has clearly ended the conversation. Give exactly one brief, natural closing sentence now. Do not ask another question. Do not continue the conversation after the closing.'
-                });
 
-                gracefulEndTimer =
+                // --------------------------------------
+                // ACTIVITY STATE
+                // --------------------------------------
+
+                let lastCustomerSpeechAt =
+                    Date.now();
+
+                let lastAssistantAudioAt =
+                    0;
+
+                let silencePromptActive =
+                    false;
+
+                let silencePromptAskedAt =
+                    0;
+
+                let silenceEnding =
+                    false;
+
+
+                // --------------------------------------
+                // TIMERS
+                // --------------------------------------
+
+                let silenceMonitor =
+                    null;
+
+                let maxWarningTimer =
+                    null;
+
+                let maxClosingTimer =
+                    null;
+
+                let maxHardTimer =
+                    null;
+
+                let pendingHangupInterval =
+                    null;
+
+                let pendingHangupHardTimer =
+                    null;
+
+
+                // --------------------------------------
+                // OPENAI
+                // --------------------------------------
+
+                const openAiWs =
+                    new WebSocket(
+                        'wss://api.openai.com/v1/live/sessions',
+
+                        {
+                            headers: {
+
+                                Authorization:
+                                    `Bearer ${OPENAI_API_KEY}`,
+
+                                'User-Agent':
+                                    USER_AGENT
+                            }
+                        }
+                    );
+
+
+                const send =
+                    (event) => {
+
+                        if (
+                            openAiWs.readyState ===
+                            WebSocket.OPEN
+                        ) {
+
+                            openAiWs.send(
+                                JSON.stringify(
+                                    event
+                                )
+                            );
+                        }
+                    };
+
+
+                // --------------------------------------
+                // TRANSCRIPT
+                // --------------------------------------
+
+                const queueTranscript =
+                    (
+                        speaker,
+                        text,
+                        startMs = null,
+                        endMs = null,
+                        eventId = null
+                    ) => {
+
+                        if (
+                            typeof text !==
+                                'string' ||
+                            text.length === 0
+                        ) {
+
+                            return;
+                        }
+
+                        transcriptBuffer.push({
+                            speaker,
+                            text,
+                            startMs,
+                            endMs,
+                            eventId,
+
+                            sessionId:
+                                openAiSessionId
+                        });
+                    };
+
+
+                const flushTranscript =
+                    () => {
+
+                        if (
+                            !currentJobNumber ||
+                            transcriptBuffer.length ===
+                                0
+                        ) {
+
+                            return transcriptSaveChain;
+                        }
+
+                        const jobNumber =
+                            currentJobNumber;
+
+                        const chunks =
+                            transcriptBuffer;
+
+                        transcriptBuffer =
+                            [];
+
+                        transcriptSaveChain =
+                            transcriptSaveChain
+
+                                .then(
+                                    async () => {
+
+                                        await saveTranscriptChunks(
+                                            jobNumber,
+                                            chunks
+                                        );
+
+                                        console.log(
+                                            `Transcript saved: Job #${jobNumber}, ${chunks.length} chunks`
+                                        );
+                                    }
+                                )
+
+                                .catch(
+                                    (error) => {
+
+                                        console.error(
+                                            'Transcript save error:',
+                                            error
+                                        );
+
+                                        transcriptBuffer = [
+                                            ...chunks,
+                                            ...transcriptBuffer
+                                        ];
+                                    }
+                                );
+
+                        return transcriptSaveChain;
+                    };
+
+
+                const transcriptTimer =
                     setInterval(
                         () => {
 
-                            if (
-                                assistantSpokeAfterEnd &&
-                                lastAssistantAudioAt > 0 &&
-                                Date.now() -
-                                    lastAssistantAudioAt >=
-                                    1800
-                            ) {
-
-                                clearInterval(
-                                    gracefulEndTimer
-                                );
-
-                                gracefulEndTimer =
-                                    null;
-
-                                void endTwilioCall(
-                                    'customer-goodbye'
-                                );
-                            }
+                            void flushTranscript();
                         },
-                        250
+                        1000
                     );
 
-                gracefulEndFallbackTimer =
-                    setTimeout(
-                        () => {
 
-                            if (
-                                !twilioHangupRequested
-                            ) {
+                // --------------------------------------
+                // TIMER CLEANUP
+                // --------------------------------------
 
-                                console.log(
-                                    'Graceful end fallback reached'
-                                );
-
-                                void endTwilioCall(
-                                    'customer-goodbye-fallback'
-                                );
-                            }
-                        },
-                        10000
-                    );
-            };
-
-            const startSession = () => {
-
-                if (
-                    sessionRequested ||
-                    !streamSid ||
-                    openAiWs.readyState !==
-                        WebSocket.OPEN
-                ) {
-
-                    return;
-                }
-
-                sessionRequested = true;
-
-                send({
-                    type:
-                        'session.start',
-
-                    session: {
-
-                        model:
-                            MODEL,
-
-                        instructions:
-                            VOICE_PROMPT,
-
-                        delegation: {
-                            type:
-                                'client'
-                        },
-
-                        audio: {
-
-                            format: {
-
-                                type:
-                                    'audio/pcmu',
-
-                                rate:
-                                    8000
-                            },
-
-                            output: {
-
-                                voice:
-                                    VOICE
-                            }
-                        }
-                    }
-                });
-            };
-
-            openAiWs.on(
-                'open',
-                () => {
-
-                    console.log(
-                        'Connected to GPT-Live-1'
-                    );
-
-                    startSession();
-                }
-            );
-
-            openAiWs.on(
-                'message',
-                (data) => {
-
-                    try {
-
-                        const event =
-                            JSON.parse(data);
+                const clearPendingHangup =
+                    () => {
 
                         if (
-                            event.type ===
-                            'session.started'
+                            pendingHangupInterval
                         ) {
 
-                            sessionReady =
-                                true;
+                            clearInterval(
+                                pendingHangupInterval
+                            );
 
-                            openAiSessionId =
-                                event.session?.id ||
+                            pendingHangupInterval =
                                 null;
+                        }
+
+                        if (
+                            pendingHangupHardTimer
+                        ) {
+
+                            clearTimeout(
+                                pendingHangupHardTimer
+                            );
+
+                            pendingHangupHardTimer =
+                                null;
+                        }
+                    };
+
+
+                const clearAiTimers =
+                    () => {
+
+                        if (silenceMonitor) {
+
+                            clearInterval(
+                                silenceMonitor
+                            );
+
+                            silenceMonitor =
+                                null;
+                        }
+
+                        if (maxWarningTimer) {
+
+                            clearTimeout(
+                                maxWarningTimer
+                            );
+
+                            maxWarningTimer =
+                                null;
+                        }
+
+                        if (maxClosingTimer) {
+
+                            clearTimeout(
+                                maxClosingTimer
+                            );
+
+                            maxClosingTimer =
+                                null;
+                        }
+
+                        if (maxHardTimer) {
+
+                            clearTimeout(
+                                maxHardTimer
+                            );
+
+                            maxHardTimer =
+                                null;
+                        }
+
+                        clearPendingHangup();
+                    };
+
+
+                // --------------------------------------
+                // CLOSE
+                // --------------------------------------
+
+                const closeSockets =
+                    () => {
+
+                        if (
+                            connection.readyState ===
+                            WebSocket.OPEN
+                        ) {
+
+                            connection.close();
+                        }
+
+                        if (
+                            openAiWs.readyState ===
+                            WebSocket.OPEN
+                        ) {
+
+                            openAiWs.close();
+                        }
+                    };
+
+
+                const shutdown =
+                    async (
+                        reason,
+                        waitForFinalTranscript =
+                            false
+                    ) => {
+
+                        if (shuttingDown) {
+                            return;
+                        }
+
+                        shuttingDown =
+                            true;
+
+                        clearInterval(
+                            transcriptTimer
+                        );
+
+                        clearAiTimers();
+
+                        if (
+                            waitForFinalTranscript &&
+                            openAiWs.readyState ===
+                                WebSocket.OPEN
+                        ) {
+
+                            await new Promise(
+                                (resolve) =>
+                                    setTimeout(
+                                        resolve,
+                                        500
+                                    )
+                            );
+                        }
+
+                        await flushTranscript();
+
+                        await transcriptSaveChain;
+
+                        console.log(
+                            `Closing call resources: ${reason}`
+                        );
+
+                        closeSockets();
+                    };
+
+
+                // --------------------------------------
+                // TWILIO API
+                // --------------------------------------
+
+                const twilioAuthHeader =
+                    () => {
+
+                        return (
+                            'Basic ' +
+                            Buffer
+                                .from(
+                                    `${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`
+                                )
+                                .toString(
+                                    'base64'
+                                )
+                        );
+                    };
+
+
+                const updateTwilioCall =
+                    async (
+                        callSid,
+                        formValues
+                    ) => {
+
+                        const body =
+                            new URLSearchParams(
+                                formValues
+                            );
+
+                        const response =
+                            await fetch(
+                                `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Calls/${encodeURIComponent(callSid)}.json`,
+
+                                {
+                                    method:
+                                        'POST',
+
+                                    headers: {
+
+                                        Authorization:
+                                            twilioAuthHeader(),
+
+                                        'Content-Type':
+                                            'application/x-www-form-urlencoded'
+                                    },
+
+                                    body
+                                }
+                            );
+
+                        if (!response.ok) {
+
+                            const responseText =
+                                await response.text();
+
+                            throw new Error(
+                                `Twilio ${response.status}: ${responseText}`
+                            );
+                        }
+
+                        return response;
+                    };
+
+
+                // --------------------------------------
+                // END CALL
+                // --------------------------------------
+
+                const endTwilioCall =
+                    async (
+                        reason =
+                            'conversation-ended'
+                    ) => {
+
+                        if (
+                            twilioHangupRequested ||
+                            !currentCallSid ||
+                            transferInProgress
+                        ) {
+
+                            return;
+                        }
+
+                        twilioHangupRequested =
+                            true;
+
+                        clearAiTimers();
+
+                        try {
+
+                            await flushTranscript();
+
+                            await transcriptSaveChain;
+
+                            await updateTwilioCall(
+                                currentCallSid,
+
+                                {
+                                    Status:
+                                        'completed'
+                                }
+                            );
 
                             console.log(
-                                'GPT-Live-1 session:',
-                                openAiSessionId
+                                `Twilio call ended: ${currentCallSid} (${reason})`
+                            );
+
+                            setTimeout(
+                                () => {
+
+                                    void shutdown(
+                                        'twilio-api-end',
+                                        true
+                                    );
+                                },
+                                500
+                            );
+
+                        } catch (error) {
+
+                            twilioHangupRequested =
+                                false;
+
+                            console.error(
+                                'Twilio end call error:',
+                                error
+                            );
+                        }
+                    };
+
+
+                const scheduleHangupAfterAssistant =
+                    (
+                        reason,
+                        hardTimeoutMs =
+                            4000
+                    ) => {
+
+                        clearPendingHangup();
+
+                        const marker =
+                            Date.now() - 500;
+
+                        pendingHangupInterval =
+                            setInterval(
+                                () => {
+
+                                    if (
+                                        lastAssistantAudioAt >
+                                            marker &&
+
+                                        Date.now() -
+                                            lastAssistantAudioAt >=
+                                            800
+                                    ) {
+
+                                        clearPendingHangup();
+
+                                        void endTwilioCall(
+                                            reason
+                                        );
+                                    }
+
+                                },
+                                200
+                            );
+
+                        pendingHangupHardTimer =
+                            setTimeout(
+                                () => {
+
+                                    clearPendingHangup();
+
+                                    void endTwilioCall(
+                                        `${reason}-fallback`
+                                    );
+                                },
+                                hardTimeoutMs
+                            );
+                    };
+
+
+                const requestGracefulEnd =
+                    () => {
+
+                        if (
+                            customerRequestedEnd ||
+                            transferInProgress ||
+                            twilioHangupRequested
+                        ) {
+
+                            return;
+                        }
+
+                        customerRequestedEnd =
+                            true;
+
+                        console.log(
+                            'Customer clearly ended the conversation'
+                        );
+
+                        send({
+
+                            type:
+                                'session.instructions.append',
+
+                            delegation_id:
+                                null,
+
+                            content:
+                                'The caller has clearly ended the conversation. Give exactly one brief natural closing sentence now. Do not ask another question and do not continue the conversation afterward.'
+                        });
+
+                        scheduleHangupAfterAssistant(
+                            'customer-goodbye',
+                            4000
+                        );
+                    };
+
+
+                // --------------------------------------
+                // HUMAN TRANSFER
+                // --------------------------------------
+
+                const requestOwnerTransfer =
+                    async (
+                        reason =
+                            'customer-request'
+                    ) => {
+
+                        if (
+                            transferInProgress ||
+                            twilioHangupRequested ||
+                            shuttingDown ||
+                            !currentCallSid ||
+                            !currentPublicBaseUrl
+                        ) {
+
+                            return;
+                        }
+
+                        transferInProgress =
+                            true;
+
+                        clearAiTimers();
+
+                        console.log(
+                            `Human transfer requested: ${reason}`
+                        );
+
+                        send({
+
+                            type:
+                                'session.commentary.append',
+
+                            delegation_id:
+                                null,
+
+                            content:
+                                "Sure, I'll try to connect you now."
+                        });
+
+                        await new Promise(
+                            (resolve) =>
+                                setTimeout(
+                                    resolve,
+                                    1800
+                                )
+                        );
+
+                        try {
+
+                            await flushTranscript();
+
+                            await transcriptSaveChain;
+
+                            const transferResultUrl =
+                                `${currentPublicBaseUrl}/transfer-result?started=${encodeURIComponent(callStartMs)}`;
+
+                            const ownerScreenUrl =
+                                `${currentPublicBaseUrl}/owner-screen?parent=${encodeURIComponent(currentCallSid)}`;
+
+                            const transferTwiml =
+`<Response>
+    <Dial
+        answerOnBridge="true"
+        timeout="20"
+        action="${escapeXml(transferResultUrl)}"
+        method="POST">
+
+        <Number
+            url="${escapeXml(ownerScreenUrl)}"
+            method="POST">${escapeXml(OWNER_PHONE_NUMBER)}</Number>
+
+    </Dial>
+</Response>`;
+
+                            await updateTwilioCall(
+                                currentCallSid,
+
+                                {
+                                    Twiml:
+                                        transferTwiml
+                                }
+                            );
+
+                            console.log(
+                                `Transfer started for ${currentCallSid}`
+                            );
+
+                        } catch (error) {
+
+                            transferInProgress =
+                                false;
+
+                            console.error(
+                                'Human transfer error:',
+                                error
                             );
 
                             send({
-                                type:
-                                    'session.instructions.append',
 
-                                delegation_id:
-                                    null,
-
-                                content:
-                                    `Your first spoken line on this call is exactly: "${OPENING}"`
-                            });
-
-                            send({
                                 type:
                                     'session.commentary.append',
 
@@ -700,351 +1303,988 @@ fastify.register(async (fastify) => {
                                     null,
 
                                 content:
-                                    OPENING
+                                    "I'm sorry, I couldn't start the transfer. I'll make a note that you asked for a callback."
                             });
 
-                        } else if (
-                            event.type ===
-                                'session.output_audio.delta' &&
+                            scheduleAiTimers();
+                        }
+                    };
 
-                            streamSid &&
 
-                            connection.readyState ===
+                // --------------------------------------
+                // SILENCE + 5 MINUTE LIMIT
+                // --------------------------------------
+
+                const scheduleAiTimers =
+                    () => {
+
+                        clearAiTimers();
+
+                        const now =
+                            Date.now();
+
+                        const elapsed =
+                            Math.max(
+                                0,
+                                now - callStartMs
+                            );
+
+                        const warningDelay =
+                            MAX_CALL_WARNING_MS -
+                            elapsed;
+
+                        const closingDelay =
+                            MAX_CALL_CLOSING_MS -
+                            elapsed;
+
+                        const hardDelay =
+                            MAX_AI_CALL_MS -
+                            elapsed;
+
+
+                        // 4:50 warning
+
+                        if (
+                            warningDelay > 0
+                        ) {
+
+                            maxWarningTimer =
+                                setTimeout(
+                                    () => {
+
+                                        if (
+                                            transferInProgress ||
+                                            shuttingDown ||
+                                            twilioHangupRequested ||
+                                            customerRequestedEnd
+                                        ) {
+
+                                            return;
+                                        }
+
+                                        send({
+
+                                            type:
+                                                'session.commentary.append',
+
+                                            delegation_id:
+                                                null,
+
+                                            content:
+                                                "We're almost at the end of the call. Is there anything else you need?"
+                                        });
+
+                                    },
+                                    warningDelay
+                                );
+                        }
+
+
+                        // 4:56 closing message
+
+                        if (
+                            closingDelay > 0
+                        ) {
+
+                            maxClosingTimer =
+                                setTimeout(
+                                    () => {
+
+                                        if (
+                                            transferInProgress ||
+                                            shuttingDown ||
+                                            twilioHangupRequested
+                                        ) {
+
+                                            return;
+                                        }
+
+                                        send({
+
+                                            type:
+                                                'session.commentary.append',
+
+                                            delegation_id:
+                                                null,
+
+                                            content:
+                                                "I'll go ahead and disconnect the call now. Have a good day."
+                                        });
+
+                                        scheduleHangupAfterAssistant(
+                                            'five-minute-limit',
+                                            3500
+                                        );
+
+                                    },
+                                    closingDelay
+                                );
+                        }
+
+
+                        // Hard 5:00 limit
+
+                        if (
+                            hardDelay <= 0
+                        ) {
+
+                            void endTwilioCall(
+                                'five-minute-hard-limit'
+                            );
+
+                            return;
+                        }
+
+                        maxHardTimer =
+                            setTimeout(
+                                () => {
+
+                                    void endTwilioCall(
+                                        'five-minute-hard-limit'
+                                    );
+
+                                },
+                                hardDelay
+                            );
+
+
+                        // Silence monitor
+
+                        silenceMonitor =
+                            setInterval(
+                                () => {
+
+                                    if (
+                                        !sessionReady ||
+                                        transferInProgress ||
+                                        shuttingDown ||
+                                        twilioHangupRequested ||
+                                        customerRequestedEnd ||
+                                        silenceEnding
+                                    ) {
+
+                                        return;
+                                    }
+
+                                    const currentTime =
+                                        Date.now();
+
+
+                                    // We already asked:
+                                    // "Are you still there?"
+
+                                    if (
+                                        silencePromptActive
+                                    ) {
+
+                                        if (
+                                            lastCustomerSpeechAt >
+                                            silencePromptAskedAt
+                                        ) {
+
+                                            silencePromptActive =
+                                                false;
+
+                                            silencePromptAskedAt =
+                                                0;
+
+                                            console.log(
+                                                'Customer returned after silence check'
+                                            );
+
+                                            return;
+                                        }
+
+
+                                        // Another 10 seconds silence
+
+                                        if (
+                                            currentTime -
+                                                silencePromptAskedAt >=
+                                                SILENCE_HANGUP_MS
+                                        ) {
+
+                                            silencePromptActive =
+                                                false;
+
+                                            silenceEnding =
+                                                true;
+
+                                            console.log(
+                                                'Customer silent after follow-up'
+                                            );
+
+                                            send({
+
+                                                type:
+                                                    'session.commentary.append',
+
+                                                delegation_id:
+                                                    null,
+
+                                                content:
+                                                    "I'll go ahead and disconnect the call. Have a good day."
+                                            });
+
+                                            scheduleHangupAfterAssistant(
+                                                'silence-timeout',
+                                                4000
+                                            );
+                                        }
+
+                                        return;
+                                    }
+
+
+                                    const activityReference =
+                                        Math.max(
+                                            lastCustomerSpeechAt,
+                                            lastAssistantAudioAt,
+                                            callStartMs
+                                        );
+
+
+                                    // 25 seconds silence
+
+                                    if (
+                                        currentTime -
+                                            activityReference >=
+                                            SILENCE_CHECK_MS
+                                    ) {
+
+                                        silencePromptActive =
+                                            true;
+
+                                        silencePromptAskedAt =
+                                            currentTime;
+
+                                        console.log(
+                                            '25 seconds of customer silence'
+                                        );
+
+                                        send({
+
+                                            type:
+                                                'session.commentary.append',
+
+                                            delegation_id:
+                                                null,
+
+                                            content:
+                                                'Are you still there?'
+                                        });
+                                    }
+
+                                },
+                                500
+                            );
+                    };
+
+
+                // --------------------------------------
+                // START LIVE SESSION
+                // --------------------------------------
+
+                const startSession =
+                    () => {
+
+                        if (
+                            sessionRequested ||
+                            !streamSid ||
+                            openAiWs.readyState !==
                                 WebSocket.OPEN
                         ) {
 
-                            lastAssistantAudioAt =
-                                Date.now();
+                            return;
+                        }
 
-                            if (
-                                customerRequestedEnd
-                            ) {
+                        sessionRequested =
+                            true;
 
-                                assistantSpokeAfterEnd =
-                                    true;
-                            }
+                        send({
 
-                            connection.send(
-                                JSON.stringify({
-                                    event:
-                                        'media',
+                            type:
+                                'session.start',
 
-                                    streamSid,
+                            session: {
 
-                                    media: {
-                                        payload:
-                                            event.delta
+                                model:
+                                    MODEL,
+
+                                instructions:
+                                    VOICE_PROMPT,
+
+                                delegation: {
+
+                                    type:
+                                        'client'
+                                },
+
+                                audio: {
+
+                                    format: {
+
+                                        type:
+                                            'audio/pcmu',
+
+                                        rate:
+                                            8000
+                                    },
+
+                                    output: {
+
+                                        voice:
+                                            VOICE
                                     }
-                                })
-                            );
+                                }
+                            }
+                        });
+                    };
 
-                        } else if (
-                            event.type ===
-                                'session.input_transcript.delta'
-                        ) {
 
-                            console.log(
-                                'Customer:',
-                                event.delta
-                            );
+                // --------------------------------------
+                // OPENAI OPEN
+                // --------------------------------------
 
-                            queueTranscript(
-                                'customer',
-                                event.delta,
-                                event.start_ms ??
-                                    null,
-                                event.end_ms ??
-                                    null,
-                                event.event_id ??
-                                    null
-                            );
+                openAiWs.on(
+                    'open',
 
-                            customerTextWindow = (
-                                customerTextWindow +
-                                event.delta
-                            ).slice(-300);
+                    () => {
+
+                        console.log(
+                            'Connected to GPT-Live-1'
+                        );
+
+                        startSession();
+                    }
+                );
+
+
+                // --------------------------------------
+                // OPENAI EVENTS
+                // --------------------------------------
+
+                openAiWs.on(
+                    'message',
+
+                    (data) => {
+
+                        try {
+
+                            const event =
+                                JSON.parse(
+                                    data
+                                );
+
+
+                            // Session ready
 
                             if (
-                                !customerRequestedEnd &&
-                                containsExplicitGoodbye(
-                                    customerTextWindow
-                                )
+                                event.type ===
+                                'session.started'
                             ) {
 
-                                requestGracefulEnd();
-                            }
+                                sessionReady =
+                                    true;
 
-                        } else if (
-                            event.type ===
-                                'session.output_transcript.delta'
-                        ) {
+                                openAiSessionId =
+                                    event.session?.id ||
+                                    null;
 
-                            console.log(
-                                'Assistant:',
-                                event.delta
-                            );
+                                console.log(
+                                    'GPT-Live-1 session:',
+                                    openAiSessionId
+                                );
 
-                            queueTranscript(
-                                'assistant',
-                                event.delta,
-                                event.start_ms ??
-                                    null,
-                                event.end_ms ??
-                                    null,
-                                event.event_id ??
-                                    null
-                            );
+                                const firstLine =
+                                    resumeReason ===
+                                        'transfer-unavailable'
 
-                            assistantTextWindow = (
-                                assistantTextWindow +
-                                event.delta
-                            ).slice(-300);
+                                        ? "Thanks for waiting. I couldn't connect you right now, but I can keep helping you."
 
-                        } else if (
-                            event.type ===
-                                'session.delegation.created'
-                        ) {
-
-                            const delegationId =
-                                event.delegation?.id ||
-                                null;
-
-                            console.log(
-                                'Delegation blocked:',
-                                delegationId
-                            );
-
-                            if (delegationId) {
+                                        : OPENING;
 
                                 send({
+
+                                    type:
+                                        'session.instructions.append',
+
+                                    delegation_id:
+                                        null,
+
+                                    content:
+                                        `Your first spoken line on this call is exactly: "${firstLine}"`
+                                });
+
+                                send({
+
                                     type:
                                         'session.commentary.append',
 
-                                    event_id:
-                                        `blocked_${Date.now()}`,
-
                                     delegation_id:
-                                        delegationId,
+                                        null,
 
                                     content:
-                                        'No external lookup or backend search is available for this request. Do not say you are checking or searching. If the requested fact is not confirmed in the business instructions or by the caller, briefly say that you do not have confirmed information.'
+                                        firstLine
                                 });
-                            }
 
-                        } else if (
-                            event.type ===
-                                'error'
-                        ) {
+                                scheduleAiTimers();
 
-                            console.error(
-                                'GPT-Live-1 error:',
-                                event.error
-                            );
-                        }
 
-                    } catch (error) {
+                            // Mia audio
 
-                        console.error(
-                            'OpenAI message error:',
-                            error
-                        );
-                    }
-                }
-            );
+                            } else if (
+                                event.type ===
+                                    'session.output_audio.delta' &&
 
-            connection.on(
-                'message',
+                                streamSid &&
 
-                async (message) => {
+                                connection.readyState ===
+                                    WebSocket.OPEN
+                            ) {
 
-                    try {
+                                lastAssistantAudioAt =
+                                    Date.now();
 
-                        const data =
-                            JSON.parse(message);
+                                connection.send(
+                                    JSON.stringify({
 
-                        if (
-                            data.event ===
-                                'media' &&
+                                        event:
+                                            'media',
 
-                            sessionReady &&
+                                        streamSid,
 
-                            openAiWs.readyState ===
-                                WebSocket.OPEN
-                        ) {
+                                        media: {
 
-                            send({
-                                type:
-                                    'session.input_audio.append',
+                                            payload:
+                                                event.delta
+                                        }
+                                    })
+                                );
 
-                                audio:
-                                    data.media.payload
-                            });
 
-                        } else if (
-                            data.event ===
-                                'start'
-                        ) {
+                            // Customer transcript
 
-                            streamSid =
-                                data.start.streamSid;
+                            } else if (
+                                event.type ===
+                                    'session.input_transcript.delta'
+                            ) {
 
-                            currentCallSid =
-                                data.start.callSid ||
-                                null;
+                                console.log(
+                                    'Customer:',
+                                    event.delta
+                                );
 
-                            const callerPhone =
-                                data.start
-                                    .customParameters
-                                    ?.From ||
-                                null;
-
-                            console.log(
-                                'Incoming Twilio stream:',
-                                streamSid
-                            );
-
-                            console.log(
-                                'Twilio Call SID:',
-                                currentCallSid
-                            );
-
-                            startSession();
-
-                            try {
+                                lastCustomerSpeechAt =
+                                    Date.now();
 
                                 if (
-                                    !callerPhone
+                                    silencePromptActive
                                 ) {
 
-                                    console.error(
-                                        'Caller phone number was not received'
-                                    );
+                                    silencePromptActive =
+                                        false;
 
-                                } else {
-
-                                    const customer =
-                                        await findOrCreateCustomer(
-                                            callerPhone
-                                        );
-
-                                    const job =
-                                        await createJobForCall({
-                                            customerId:
-                                                customer.id,
-
-                                            callSid:
-                                                currentCallSid
-                                        });
-
-                                    currentJobNumber =
-                                        job.job_number;
-
-                                    console.log(
-                                        `CRM job created: #${job.job_number}`
-                                    );
-
-                                    await flushTranscript();
+                                    silencePromptAskedAt =
+                                        0;
                                 }
 
-                            } catch (error) {
+                                queueTranscript(
+                                    'customer',
+                                    event.delta,
+
+                                    event.start_ms ??
+                                        null,
+
+                                    event.end_ms ??
+                                        null,
+
+                                    event.event_id ??
+                                        null
+                                );
+
+                                customerTextWindow =
+                                    (
+                                        customerTextWindow +
+                                        ' ' +
+                                        event.delta
+                                    ).slice(-500);
+
+
+                                // Goodbye
+
+                                if (
+                                    !customerRequestedEnd &&
+                                    containsExplicitGoodbye(
+                                        customerTextWindow
+                                    )
+                                ) {
+
+                                    customerTextWindow =
+                                        '';
+
+                                    requestGracefulEnd();
+
+                                    return;
+                                }
+
+
+                                // Direct request for person
+
+                                if (
+                                    !transferInProgress &&
+                                    containsExplicitHumanRequest(
+                                        customerTextWindow
+                                    )
+                                ) {
+
+                                    customerTextWindow =
+                                        '';
+
+                                    void requestOwnerTransfer(
+                                        'explicit-customer-request'
+                                    );
+
+                                    return;
+                                }
+
+
+                                // Mia offered transfer;
+                                // customer says yes/no
+
+                                if (
+                                    !transferInProgress &&
+                                    assistantOfferedTransferUntil >
+                                        Date.now()
+                                ) {
+
+                                    if (
+                                        containsAffirmative(
+                                            customerTextWindow
+                                        )
+                                    ) {
+
+                                        assistantOfferedTransferUntil =
+                                            0;
+
+                                        customerTextWindow =
+                                            '';
+
+                                        void requestOwnerTransfer(
+                                            'accepted-mia-offer'
+                                        );
+
+                                        return;
+                                    }
+
+                                    if (
+                                        containsNegative(
+                                            customerTextWindow
+                                        )
+                                    ) {
+
+                                        assistantOfferedTransferUntil =
+                                            0;
+
+                                        customerTextWindow =
+                                            '';
+                                    }
+                                }
+
+
+                            // Assistant transcript
+
+                            } else if (
+                                event.type ===
+                                    'session.output_transcript.delta'
+                            ) {
+
+                                console.log(
+                                    'Assistant:',
+                                    event.delta
+                                );
+
+                                queueTranscript(
+                                    'assistant',
+                                    event.delta,
+
+                                    event.start_ms ??
+                                        null,
+
+                                    event.end_ms ??
+                                        null,
+
+                                    event.event_id ??
+                                        null
+                                );
+
+                                assistantTextWindow =
+                                    (
+                                        assistantTextWindow +
+                                        ' ' +
+                                        event.delta
+                                    ).slice(-500);
+
+                                const assistantNormalized =
+                                    normalizeForMatch(
+                                        assistantTextWindow
+                                    );
+
+
+                                // Mia offered transfer
+
+                                if (
+                                    /would you like me to connect you (with|to) (someone|a person|the owner|a technician|a manager)/i.test(
+                                        assistantNormalized
+                                    ) ||
+
+                                    /(хотите|хочешь).*(соединить|перевести).*(человек|менеджер|владелец|техник|мастер)/i.test(
+                                        assistantNormalized
+                                    )
+                                ) {
+
+                                    assistantOfferedTransferUntil =
+                                        Date.now() +
+                                        20_000;
+
+                                    customerTextWindow =
+                                        '';
+                                }
+
+
+                            // Block unwanted delegation
+
+                            } else if (
+                                event.type ===
+                                    'session.delegation.created'
+                            ) {
+
+                                const delegationId =
+                                    event.delegation?.id ||
+                                    null;
+
+                                console.log(
+                                    'Delegation blocked:',
+                                    delegationId
+                                );
+
+                                if (
+                                    delegationId
+                                ) {
+
+                                    send({
+
+                                        type:
+                                            'session.commentary.append',
+
+                                        event_id:
+                                            `blocked_${Date.now()}`,
+
+                                        delegation_id:
+                                            delegationId,
+
+                                        content:
+                                            'No external lookup or backend search is available for this request. Do not say you are checking or searching. If the requested fact is not confirmed in the business instructions or by the caller, briefly say that you do not have confirmed information.'
+                                    });
+                                }
+
+
+                            // OpenAI error
+
+                            } else if (
+                                event.type ===
+                                    'error'
+                            ) {
 
                                 console.error(
-                                    'CRM create job error:',
-                                    error
+                                    'GPT-Live-1 error:',
+                                    event.error
                                 );
                             }
 
-                        } else if (
-                            data.event ===
-                                'stop'
-                        ) {
+                        } catch (error) {
 
-                            await shutdown(
-                                'twilio-stop',
-                                true
+                            console.error(
+                                'OpenAI message error:',
+                                error
                             );
                         }
+                    }
+                );
 
-                    } catch (error) {
 
-                        console.error(
-                            'Twilio message error:',
-                            error
+                // --------------------------------------
+                // TWILIO EVENTS
+                // --------------------------------------
+
+                connection.on(
+                    'message',
+
+                    async (message) => {
+
+                        try {
+
+                            const data =
+                                JSON.parse(
+                                    message
+                                );
+
+
+                            // Customer audio
+
+                            if (
+                                data.event ===
+                                    'media' &&
+
+                                sessionReady &&
+
+                                openAiWs.readyState ===
+                                    WebSocket.OPEN
+                            ) {
+
+                                send({
+
+                                    type:
+                                        'session.input_audio.append',
+
+                                    audio:
+                                        data.media.payload
+                                });
+
+
+                            // Stream started
+
+                            } else if (
+                                data.event ===
+                                    'start'
+                            ) {
+
+                                streamSid =
+                                    data.start.streamSid;
+
+                                currentCallSid =
+                                    data.start.callSid ||
+                                    null;
+
+                                const custom =
+                                    data.start
+                                        .customParameters ||
+                                    {};
+
+                                const callerPhone =
+                                    custom.From ||
+                                    null;
+
+                                currentPublicBaseUrl =
+                                    custom.BaseUrl ||
+                                    null;
+
+                                const parsedStart =
+                                    Number(
+                                        custom.CallStartMs
+                                    );
+
+                                callStartMs =
+                                    Number.isFinite(
+                                        parsedStart
+                                    ) &&
+                                    parsedStart > 0
+
+                                        ? parsedStart
+                                        : Date.now();
+
+                                resumeReason =
+                                    custom.ResumeReason ||
+                                    null;
+
+                                lastCustomerSpeechAt =
+                                    Date.now();
+
+                                console.log(
+                                    'Incoming Twilio stream:',
+                                    streamSid
+                                );
+
+                                console.log(
+                                    'Twilio Call SID:',
+                                    currentCallSid
+                                );
+
+                                if (
+                                    resumeReason
+                                ) {
+
+                                    console.log(
+                                        'Call resumed:',
+                                        resumeReason
+                                    );
+                                }
+
+                                startSession();
+
+
+                                // CRM
+
+                                try {
+
+                                    if (
+                                        !callerPhone
+                                    ) {
+
+                                        console.error(
+                                            'Caller phone number was not received'
+                                        );
+
+                                    } else {
+
+                                        const customer =
+                                            await findOrCreateCustomer(
+                                                callerPhone
+                                            );
+
+                                        const job =
+                                            await createJobForCall({
+
+                                                customerId:
+                                                    customer.id,
+
+                                                callSid:
+                                                    currentCallSid
+                                            });
+
+                                        currentJobNumber =
+                                            job.job_number;
+
+                                        console.log(
+                                            `CRM job ready: #${job.job_number}`
+                                        );
+
+                                        await flushTranscript();
+                                    }
+
+                                } catch (error) {
+
+                                    console.error(
+                                        'CRM create job error:',
+                                        error
+                                    );
+                                }
+
+
+                            // Stream stopped
+
+                            } else if (
+                                data.event ===
+                                    'stop'
+                            ) {
+
+                                await shutdown(
+                                    'twilio-stop',
+                                    true
+                                );
+                            }
+
+                        } catch (error) {
+
+                            console.error(
+                                'Twilio message error:',
+                                error
+                            );
+                        }
+                    }
+                );
+
+
+                // --------------------------------------
+                // TWILIO CLOSED
+                // --------------------------------------
+
+                connection.on(
+                    'close',
+
+                    () => {
+
+                        void shutdown(
+                            'twilio-close',
+                            true
+                        );
+
+                        console.log(
+                            'Caller disconnected'
                         );
                     }
-                }
-            );
+                );
 
-            connection.on(
-                'close',
-                () => {
 
-                    void shutdown(
-                        'twilio-close',
-                        true
-                    );
+                connection.on(
+                    'error',
 
-                    console.log(
-                        'Caller disconnected'
-                    );
-                }
-            );
+                    (error) => {
 
-            connection.on(
-                'error',
-                (error) => {
+                        console.error(
+                            'Twilio WebSocket error:',
+                            error
+                        );
 
-                    console.error(
-                        'Twilio WebSocket error:',
-                        error
-                    );
+                        void shutdown(
+                            'twilio-error',
+                            false
+                        );
+                    }
+                );
 
-                    void shutdown(
-                        'twilio-error',
-                        false
-                    );
-                }
-            );
 
-            openAiWs.on(
-                'close',
+                // --------------------------------------
+                // OPENAI CLOSED
+                // --------------------------------------
 
-                (
-                    code,
-                    reason
-                ) => {
+                openAiWs.on(
+                    'close',
 
-                    console.log(
-                        'Disconnected from GPT-Live-1',
-                        code,
-                        reason.toString()
-                    );
+                    (
+                        closeCode,
+                        reason
+                    ) => {
 
-                    void shutdown(
-                        'openai-close',
-                        false
-                    );
-                }
-            );
+                        console.log(
+                            'Disconnected from GPT-Live-1',
+                            closeCode,
+                            reason.toString()
+                        );
 
-            openAiWs.on(
-                'error',
-                (error) => {
+                        void shutdown(
+                            'openai-close',
+                            false
+                        );
+                    }
+                );
 
-                    console.error(
-                        'OpenAI WebSocket error:',
-                        error
-                    );
 
-                    void shutdown(
-                        'openai-error',
-                        false
-                    );
-                }
-            );
-        }
-    );
-});
+                openAiWs.on(
+                    'error',
+
+                    (error) => {
+
+                        console.error(
+                            'OpenAI WebSocket error:',
+                            error
+                        );
+
+                        void shutdown(
+                            'openai-error',
+                            false
+                        );
+                    }
+                );
+            }
+        );
+    }
+);
+
+
+// ======================================================
+// START SERVER
+// ======================================================
 
 async function start() {
 
@@ -1053,6 +2293,7 @@ async function start() {
         await initDatabase();
 
         await fastify.listen({
+
             port:
                 PORT,
 
