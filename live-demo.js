@@ -47,6 +47,8 @@ const MAX_AI_CALL_MS = 5 * 60_000;
 const MAX_CALL_WARNING_MS = 4 * 60_000 + 50_000;
 const MAX_CALL_CLOSING_MS = 4 * 60_000 + 56_000;
 
+const AUDIO_BURST_IDLE_MS = 350;
+
 const OPENING =
     'Hi, this is Mia. How can I help you?';
 
@@ -196,6 +198,7 @@ fastify.get('/', async () => ({
     message: 'AI Call Center is running!'
 }));
 
+
 function escapeXml(value = '') {
     return String(value)
         .replace(/&/g, '&amp;')
@@ -205,6 +208,7 @@ function escapeXml(value = '') {
         .replace(/'/g, '&apos;');
 }
 
+
 function normalizeForMatch(value = '') {
     return String(value)
         .toLowerCase()
@@ -213,6 +217,7 @@ function normalizeForMatch(value = '') {
         .replace(/\s+/g, ' ')
         .trim();
 }
+
 
 function getPublicBaseUrl(request) {
     const proto =
@@ -226,6 +231,7 @@ function getPublicBaseUrl(request) {
     return `${proto}://${host}`;
 }
 
+
 function containsExplicitGoodbye(value = '') {
     const text =
         normalizeForMatch(value);
@@ -236,6 +242,7 @@ function containsExplicitGoodbye(value = '') {
     );
 }
 
+
 function containsExplicitHumanRequest(value = '') {
     const text =
         normalizeForMatch(value);
@@ -244,10 +251,13 @@ function containsExplicitHumanRequest(value = '') {
         /\b(speak|talk|connect|transfer)\b.*\b(person|human|representative|manager|owner|technician|someone)\b/i.test(text) ||
         /\b(i want|i need|can i get)\b.*\b(human|person|representative|manager|owner|technician)\b/i.test(text) ||
         /\b(real person|live person|human agent)\b/i.test(text) ||
+
         /(соедините|переведите|хочу поговорить|можно поговорить).*(человек|оператор|менеджер|владелец|техник|мастер)/i.test(text) ||
+
         /(живой человек|живым человеком|оператором|менеджером|владельцем|техником|мастером)/i.test(text)
     );
 }
+
 
 function containsAffirmative(value = '') {
     const text =
@@ -258,6 +268,7 @@ function containsAffirmative(value = '') {
         /\b(да|ага|конечно|давайте|хорошо|пожалуйста)\b/i.test(text)
     );
 }
+
 
 function containsNegative(value = '') {
     const text =
@@ -277,7 +288,10 @@ function containsNegative(value = '') {
 fastify.all(
     '/incoming-call',
 
-    async (request, reply) => {
+    async (
+        request,
+        reply
+    ) => {
 
         const baseUrl =
             getPublicBaseUrl(request);
@@ -297,24 +311,30 @@ fastify.all(
             );
 
         reply
-            .type('text/xml')
+            .type(
+                'text/xml'
+            )
             .send(
 `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Connect>
         <Stream url="${escapeXml(wsBaseUrl)}/media-stream">
+
             <Parameter
                 name="From"
                 value="${escapeXml(callerPhone)}"
             />
+
             <Parameter
                 name="BaseUrl"
                 value="${escapeXml(baseUrl)}"
             />
+
             <Parameter
                 name="CallStartMs"
                 value="${callStartMs}"
             />
+
         </Stream>
     </Connect>
 </Response>`
@@ -324,13 +344,16 @@ fastify.all(
 
 
 // ======================================================
-// OWNER CALL SCREENING
+// OWNER SCREENING
 // ======================================================
 
 fastify.all(
     '/owner-screen',
 
-    async (request, reply) => {
+    async (
+        request,
+        reply
+    ) => {
 
         const baseUrl =
             getPublicBaseUrl(request);
@@ -344,27 +367,34 @@ fastify.all(
             `${baseUrl}/owner-screen-result?parent=${encodeURIComponent(parentCallSid)}`;
 
         reply
-            .type('text/xml')
+            .type(
+                'text/xml'
+            )
             .send(
 `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
+
     <Gather
         input="dtmf"
         numDigits="1"
         timeout="7"
         action="${escapeXml(actionUrl)}"
         method="POST">
+
         <Say>
             Service call transfer from Mia.
             Press 1 to accept.
         </Say>
+
     </Gather>
 
     <Say>
-        Transfer not accepted. Goodbye.
+        Transfer not accepted.
+        Goodbye.
     </Say>
 
     <Hangup/>
+
 </Response>`
             );
     }
@@ -374,7 +404,10 @@ fastify.all(
 fastify.all(
     '/owner-screen-result',
 
-    async (request, reply) => {
+    async (
+        request,
+        reply
+    ) => {
 
         const digits =
             request.body?.Digits ||
@@ -400,7 +433,9 @@ fastify.all(
             );
 
             reply
-                .type('text/xml')
+                .type(
+                    'text/xml'
+                )
                 .send(
 `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -414,14 +449,20 @@ fastify.all(
         }
 
         reply
-            .type('text/xml')
+            .type(
+                'text/xml'
+            )
             .send(
 `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
+
     <Say>
-        Transfer declined. Goodbye.
+        Transfer declined.
+        Goodbye.
     </Say>
+
     <Hangup/>
+
 </Response>`
             );
     }
@@ -435,7 +476,10 @@ fastify.all(
 fastify.all(
     '/transfer-result',
 
-    async (request, reply) => {
+    async (
+        request,
+        reply
+    ) => {
 
         const baseUrl =
             getPublicBaseUrl(request);
@@ -451,6 +495,7 @@ fastify.all(
             '';
 
         const callerPhone =
+            request.query?.from ||
             request.body?.From ||
             request.query?.From ||
             '';
@@ -474,7 +519,9 @@ fastify.all(
             `Transfer result: ${dialCallStatus || 'unknown'}, accepted=${ownerAccepted}`
         );
 
-        if (ownerAccepted) {
+        if (
+            ownerAccepted
+        ) {
 
             acceptedTransfers.delete(
                 callSid
@@ -486,13 +533,16 @@ fastify.all(
             (
                 dialCallStatus ===
                     'completed' ||
+
                 dialCallStatus ===
                     'answered'
             )
         ) {
 
             reply
-                .type('text/xml')
+                .type(
+                    'text/xml'
+                )
                 .send(
 `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -510,15 +560,12 @@ fastify.all(
             );
 
         reply
-            .type('text/xml')
+            .type(
+                'text/xml'
+            )
             .send(
 `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-
-    <Say>
-        Sorry, no one is available right now.
-        I'll reconnect you with Mia.
-    </Say>
 
     <Connect>
         <Stream url="${escapeXml(wsBaseUrl)}/media-stream">
@@ -563,10 +610,13 @@ fastify.register(
             '/media-stream',
 
             {
-                websocket: true
+                websocket:
+                    true
             },
 
-            (connection) => {
+            (
+                connection
+            ) => {
 
                 console.log(
                     'Twilio connected'
@@ -581,6 +631,9 @@ fastify.register(
                     null;
 
                 let currentCallSid =
+                    null;
+
+                let currentCallerPhone =
                     null;
 
                 let currentJobNumber =
@@ -615,7 +668,7 @@ fastify.register(
 
 
                 // --------------------------------------
-                // TRANSCRIPT STATE
+                // TRANSCRIPT
                 // --------------------------------------
 
                 let transcriptBuffer =
@@ -638,23 +691,69 @@ fastify.register(
 
 
                 // --------------------------------------
-                // ACTIVITY STATE
+                // PLAYBACK / ACTIVITY
                 // --------------------------------------
 
                 let lastCustomerSpeechAt =
                     Date.now();
 
-                let lastAssistantAudioAt =
+                let lastAssistantPlaybackEndedAt =
                     0;
 
-                let silencePromptActive =
+                let hasAssistantPlaybackEnded =
                     false;
 
-                let silencePromptAskedAt =
+                let assistantPlaybackBusy =
+                    false;
+
+
+                let nextAssistantPurpose =
+                    null;
+
+                let currentAssistantPurpose =
+                    null;
+
+                let assistantMarkCounter =
                     0;
 
-                let silenceEnding =
-                    false;
+                let assistantMarkDebounceTimer =
+                    null;
+
+
+                const pendingPlaybackMarks =
+                    new Map();
+
+                let completedPlaybackPurposes =
+                    [];
+
+                const playbackWaiters =
+                    new Map();
+
+                const hangupByPurpose =
+                    new Map();
+
+                const hangupFallbackTimers =
+                    new Map();
+
+
+                // --------------------------------------
+                // SILENCE STATE
+                // --------------------------------------
+
+                let silencePhase =
+                    'none';
+
+                let silenceCycle =
+                    0;
+
+                let activeSilenceCycle =
+                    null;
+
+                let silencePromptRequestedAt =
+                    0;
+
+                let silencePromptFinishedAt =
+                    0;
 
 
                 // --------------------------------------
@@ -673,12 +772,6 @@ fastify.register(
                 let maxHardTimer =
                     null;
 
-                let pendingHangupInterval =
-                    null;
-
-                let pendingHangupHardTimer =
-                    null;
-
 
                 // --------------------------------------
                 // OPENAI
@@ -686,6 +779,7 @@ fastify.register(
 
                 const openAiWs =
                     new WebSocket(
+
                         'wss://api.openai.com/v1/live/sessions',
 
                         {
@@ -702,7 +796,9 @@ fastify.register(
 
 
                 const send =
-                    (event) => {
+                    (
+                        event
+                    ) => {
 
                         if (
                             openAiWs.readyState ===
@@ -710,6 +806,25 @@ fastify.register(
                         ) {
 
                             openAiWs.send(
+                                JSON.stringify(
+                                    event
+                                )
+                            );
+                        }
+                    };
+
+
+                const sendToTwilio =
+                    (
+                        event
+                    ) => {
+
+                        if (
+                            connection.readyState ===
+                            WebSocket.OPEN
+                        ) {
+
+                            connection.send(
                                 JSON.stringify(
                                     event
                                 )
@@ -734,13 +849,16 @@ fastify.register(
                         if (
                             typeof text !==
                                 'string' ||
-                            text.length === 0
+
+                            text.length ===
+                                0
                         ) {
 
                             return;
                         }
 
                         transcriptBuffer.push({
+
                             speaker,
                             text,
                             startMs,
@@ -758,6 +876,7 @@ fastify.register(
 
                         if (
                             !currentJobNumber ||
+
                             transcriptBuffer.length ===
                                 0
                         ) {
@@ -792,7 +911,9 @@ fastify.register(
                                 )
 
                                 .catch(
-                                    (error) => {
+                                    (
+                                        error
+                                    ) => {
 
                                         console.error(
                                             'Transcript save error:',
@@ -815,88 +936,119 @@ fastify.register(
                         () => {
 
                             void flushTranscript();
+
                         },
                         1000
                     );
 
 
                 // --------------------------------------
-                // TIMER CLEANUP
+                // PLAYBACK HELPERS
                 // --------------------------------------
 
-                const clearPendingHangup =
-                    () => {
+                const clearHangupPurpose =
+                    (
+                        purpose
+                    ) => {
 
-                        if (
-                            pendingHangupInterval
-                        ) {
+                        hangupByPurpose.delete(
+                            purpose
+                        );
 
-                            clearInterval(
-                                pendingHangupInterval
+                        const timer =
+                            hangupFallbackTimers.get(
+                                purpose
                             );
 
-                            pendingHangupInterval =
-                                null;
-                        }
-
                         if (
-                            pendingHangupHardTimer
+                            timer
                         ) {
 
                             clearTimeout(
-                                pendingHangupHardTimer
+                                timer
                             );
 
-                            pendingHangupHardTimer =
-                                null;
+                            hangupFallbackTimers.delete(
+                                purpose
+                            );
                         }
+                    };
+
+
+                const clearPlaybackWaiters =
+                    () => {
+
+                        for (
+                            const [
+                                ,
+                                waiter
+                            ]
+                            of playbackWaiters
+                        ) {
+
+                            clearTimeout(
+                                waiter.timer
+                            );
+
+                            waiter.resolve(
+                                false
+                            );
+                        }
+
+                        playbackWaiters.clear();
                     };
 
 
                 const clearAiTimers =
                     () => {
 
-                        if (silenceMonitor) {
+                        if (
+                            silenceMonitor
+                        ) {
 
                             clearInterval(
                                 silenceMonitor
                             );
-
-                            silenceMonitor =
-                                null;
                         }
 
-                        if (maxWarningTimer) {
+                        if (
+                            maxWarningTimer
+                        ) {
 
                             clearTimeout(
                                 maxWarningTimer
                             );
-
-                            maxWarningTimer =
-                                null;
                         }
 
-                        if (maxClosingTimer) {
+                        if (
+                            maxClosingTimer
+                        ) {
 
                             clearTimeout(
                                 maxClosingTimer
                             );
-
-                            maxClosingTimer =
-                                null;
                         }
 
-                        if (maxHardTimer) {
+                        if (
+                            maxHardTimer
+                        ) {
 
                             clearTimeout(
                                 maxHardTimer
                             );
-
-                            maxHardTimer =
-                                null;
                         }
 
-                        clearPendingHangup();
+                        silenceMonitor =
+                            null;
+
+                        maxWarningTimer =
+                            null;
+
+                        maxClosingTimer =
+                            null;
+
+                        maxHardTimer =
+                            null;
                     };
 
 
@@ -932,7 +1084,10 @@ fastify.register(
                             false
                     ) => {
 
-                        if (shuttingDown) {
+                        if (
+                            shuttingDown
+                        ) {
+
                             return;
                         }
 
@@ -945,14 +1100,52 @@ fastify.register(
 
                         clearAiTimers();
 
+                        clearPlaybackWaiters();
+
+
+                        if (
+                            assistantMarkDebounceTimer
+                        ) {
+
+                            clearTimeout(
+                                assistantMarkDebounceTimer
+                            );
+
+                            assistantMarkDebounceTimer =
+                                null;
+                        }
+
+
+                        for (
+                            const [
+                                ,
+                                timer
+                            ]
+                            of hangupFallbackTimers
+                        ) {
+
+                            clearTimeout(
+                                timer
+                            );
+                        }
+
+
+                        hangupFallbackTimers.clear();
+
+                        hangupByPurpose.clear();
+
+
                         if (
                             waitForFinalTranscript &&
+
                             openAiWs.readyState ===
                                 WebSocket.OPEN
                         ) {
 
                             await new Promise(
-                                (resolve) =>
+                                (
+                                    resolve
+                                ) =>
                                     setTimeout(
                                         resolve,
                                         500
@@ -960,13 +1153,16 @@ fastify.register(
                             );
                         }
 
+
                         await flushTranscript();
 
                         await transcriptSaveChain;
 
+
                         console.log(
                             `Closing call resources: ${reason}`
                         );
+
 
                         closeSockets();
                     };
@@ -981,6 +1177,7 @@ fastify.register(
 
                         return (
                             'Basic ' +
+
                             Buffer
                                 .from(
                                     `${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`
@@ -1005,6 +1202,7 @@ fastify.register(
 
                         const response =
                             await fetch(
+
                                 `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Calls/${encodeURIComponent(callSid)}.json`,
 
                                 {
@@ -1024,7 +1222,10 @@ fastify.register(
                                 }
                             );
 
-                        if (!response.ok) {
+
+                        if (
+                            !response.ok
+                        ) {
 
                             const responseText =
                                 await response.text();
@@ -1033,6 +1234,7 @@ fastify.register(
                                 `Twilio ${response.status}: ${responseText}`
                             );
                         }
+
 
                         return response;
                     };
@@ -1062,24 +1264,27 @@ fastify.register(
 
                         clearAiTimers();
 
+
                         try {
 
                             await flushTranscript();
 
                             await transcriptSaveChain;
 
+
                             await updateTwilioCall(
                                 currentCallSid,
-
                                 {
                                     Status:
                                         'completed'
                                 }
                             );
 
+
                             console.log(
                                 `Twilio call ended: ${currentCallSid} (${reason})`
                             );
+
 
                             setTimeout(
                                 () => {
@@ -1088,11 +1293,15 @@ fastify.register(
                                         'twilio-api-end',
                                         true
                                     );
+
                                 },
                                 500
                             );
 
-                        } catch (error) {
+
+                        } catch (
+                            error
+                        ) {
 
                             twilioHangupRequested =
                                 false;
@@ -1105,56 +1314,359 @@ fastify.register(
                     };
 
 
-                const scheduleHangupAfterAssistant =
+                const armHangupOnPurpose =
                     (
+                        purpose,
                         reason,
-                        hardTimeoutMs =
-                            4000
+                        fallbackMs =
+                            6000
                     ) => {
 
-                        clearPendingHangup();
+                        clearHangupPurpose(
+                            purpose
+                        );
 
-                        const marker =
-                            Date.now() - 500;
+                        hangupByPurpose.set(
+                            purpose,
+                            reason
+                        );
 
-                        pendingHangupInterval =
-                            setInterval(
-                                () => {
 
-                                    if (
-                                        lastAssistantAudioAt >
-                                            marker &&
-
-                                        Date.now() -
-                                            lastAssistantAudioAt >=
-                                            800
-                                    ) {
-
-                                        clearPendingHangup();
-
-                                        void endTwilioCall(
-                                            reason
-                                        );
-                                    }
-
-                                },
-                                200
-                            );
-
-                        pendingHangupHardTimer =
+                        const timer =
                             setTimeout(
                                 () => {
 
-                                    clearPendingHangup();
+                                    hangupFallbackTimers.delete(
+                                        purpose
+                                    );
+
+                                    hangupByPurpose.delete(
+                                        purpose
+                                    );
 
                                     void endTwilioCall(
                                         `${reason}-fallback`
                                     );
+
                                 },
-                                hardTimeoutMs
+                                fallbackMs
+                            );
+
+
+                        hangupFallbackTimers.set(
+                            purpose,
+                            timer
+                        );
+                    };
+
+
+                const waitForPlaybackPurpose =
+                    (
+                        purpose,
+                        timeoutMs =
+                            3500
+                    ) => {
+
+                        return new Promise(
+                            (
+                                resolve
+                            ) => {
+
+                                const timer =
+                                    setTimeout(
+                                        () => {
+
+                                            playbackWaiters.delete(
+                                                purpose
+                                            );
+
+                                            resolve(
+                                                false
+                                            );
+
+                                        },
+                                        timeoutMs
+                                    );
+
+
+                                playbackWaiters.set(
+                                    purpose,
+                                    {
+                                        resolve,
+                                        timer
+                                    }
+                                );
+                            }
+                        );
+                    };
+
+
+                const speakCommentary =
+                    (
+                        content,
+                        purpose =
+                            'general'
+                    ) => {
+
+                        nextAssistantPurpose =
+                            purpose;
+
+                        send({
+
+                            type:
+                                'session.commentary.append',
+
+                            delegation_id:
+                                null,
+
+                            content
+                        });
+                    };
+
+
+                const clearTwilioAudio =
+                    () => {
+
+                        if (
+                            streamSid &&
+
+                            connection.readyState ===
+                                WebSocket.OPEN
+                        ) {
+
+                            sendToTwilio({
+
+                                event:
+                                    'clear',
+
+                                streamSid
+                            });
+                        }
+                    };
+
+
+                // --------------------------------------
+                // TWILIO PLAYBACK MARK
+                // --------------------------------------
+
+                const onAssistantPlaybackFullyDrained =
+                    () => {
+
+                        assistantPlaybackBusy =
+                            false;
+
+                        hasAssistantPlaybackEnded =
+                            true;
+
+                        lastAssistantPlaybackEndedAt =
+                            Date.now();
+
+
+                        const purposes = [
+                            ...new Set(
+                                completedPlaybackPurposes
+                            )
+                        ];
+
+
+                        completedPlaybackPurposes =
+                            [];
+
+
+                        for (
+                            const purpose
+                            of purposes
+                        ) {
+
+
+                            const waiter =
+                                playbackWaiters.get(
+                                    purpose
+                                );
+
+
+                            if (
+                                waiter
+                            ) {
+
+                                clearTimeout(
+                                    waiter.timer
+                                );
+
+                                playbackWaiters.delete(
+                                    purpose
+                                );
+
+                                waiter.resolve(
+                                    true
+                                );
+                            }
+
+
+                            if (
+                                activeSilenceCycle !==
+                                    null &&
+
+                                purpose ===
+                                    `silence-check:${activeSilenceCycle}` &&
+
+                                silencePhase ===
+                                    'waiting_playback'
+                            ) {
+
+                                silencePhase =
+                                    'waiting_response';
+
+                                silencePromptFinishedAt =
+                                    Date.now();
+
+                                console.log(
+                                    'Silence check finished playing; waiting 10 seconds'
+                                );
+                            }
+
+
+                            const hangupReason =
+                                hangupByPurpose.get(
+                                    purpose
+                                );
+
+
+                            if (
+                                hangupReason
+                            ) {
+
+                                clearHangupPurpose(
+                                    purpose
+                                );
+
+                                void endTwilioCall(
+                                    hangupReason
+                                );
+
+                                return;
+                            }
+                        }
+                    };
+
+
+                const sendAssistantPlaybackMark =
+                    () => {
+
+                        assistantMarkDebounceTimer =
+                            null;
+
+
+                        if (
+                            !streamSid ||
+
+                            connection.readyState !==
+                                WebSocket.OPEN
+                        ) {
+
+                            return;
+                        }
+
+
+                        const markName =
+                            `mia_${Date.now()}_${++assistantMarkCounter}`;
+
+
+                        const purpose =
+                            currentAssistantPurpose ||
+                            'general';
+
+
+                        currentAssistantPurpose =
+                            null;
+
+
+                        pendingPlaybackMarks.set(
+                            markName,
+                            purpose
+                        );
+
+
+                        sendToTwilio({
+
+                            event:
+                                'mark',
+
+                            streamSid,
+
+                            mark: {
+                                name:
+                                    markName
+                            }
+                        });
+                    };
+
+
+                const noteAssistantAudioChunk =
+                    (
+                        payload
+                    ) => {
+
+                        if (
+                            nextAssistantPurpose
+                        ) {
+
+                            currentAssistantPurpose =
+                                nextAssistantPurpose;
+
+                            nextAssistantPurpose =
+                                null;
+
+                        } else if (
+                            !currentAssistantPurpose
+                        ) {
+
+                            currentAssistantPurpose =
+                                'general';
+                        }
+
+
+                        assistantPlaybackBusy =
+                            true;
+
+
+                        sendToTwilio({
+
+                            event:
+                                'media',
+
+                            streamSid,
+
+                            media: {
+
+                                payload
+                            }
+                        });
+
+
+                        if (
+                            assistantMarkDebounceTimer
+                        ) {
+
+                            clearTimeout(
+                                assistantMarkDebounceTimer
+                            );
+                        }
+
+
+                        assistantMarkDebounceTimer =
+                            setTimeout(
+
+                                sendAssistantPlaybackMark,
+
+                                AUDIO_BURST_IDLE_MS
                             );
                     };
 
+
+                // --------------------------------------
+                // GOODBYE
+                // --------------------------------------
 
                 const requestGracefulEnd =
                     () => {
@@ -1168,12 +1680,30 @@ fastify.register(
                             return;
                         }
 
+
                         customerRequestedEnd =
                             true;
+
 
                         console.log(
                             'Customer clearly ended the conversation'
                         );
+
+
+                        const purpose =
+                            `customer-goodbye:${Date.now()}`;
+
+
+                        nextAssistantPurpose =
+                            purpose;
+
+
+                        armHangupOnPurpose(
+                            purpose,
+                            'customer-goodbye',
+                            6000
+                        );
+
 
                         send({
 
@@ -1186,16 +1716,11 @@ fastify.register(
                             content:
                                 'The caller has clearly ended the conversation. Give exactly one brief natural closing sentence now. Do not ask another question and do not continue the conversation afterward.'
                         });
-
-                        scheduleHangupAfterAssistant(
-                            'customer-goodbye',
-                            4000
-                        );
                     };
 
 
                 // --------------------------------------
-                // HUMAN TRANSFER
+                // TRANSFER
                 // --------------------------------------
 
                 const requestOwnerTransfer =
@@ -1215,34 +1740,34 @@ fastify.register(
                             return;
                         }
 
+
                         transferInProgress =
                             true;
 
+
                         clearAiTimers();
+
 
                         console.log(
                             `Human transfer requested: ${reason}`
                         );
 
-                        send({
 
-                            type:
-                                'session.commentary.append',
+                        const transferPurpose =
+                            `transfer-announcement:${Date.now()}`;
 
-                            delegation_id:
-                                null,
 
-                            content:
-                                "Sure, I'll try to connect you now."
-                        });
-
-                        await new Promise(
-                            (resolve) =>
-                                setTimeout(
-                                    resolve,
-                                    1800
-                                )
+                        speakCommentary(
+                            "Sure, I'll try to connect you now.",
+                            transferPurpose
                         );
+
+
+                        await waitForPlaybackPurpose(
+                            transferPurpose,
+                            3500
+                        );
+
 
                         try {
 
@@ -1250,14 +1775,20 @@ fastify.register(
 
                             await transcriptSaveChain;
 
+
                             const transferResultUrl =
-                                `${currentPublicBaseUrl}/transfer-result?started=${encodeURIComponent(callStartMs)}`;
+                                `${currentPublicBaseUrl}/transfer-result` +
+                                `?started=${encodeURIComponent(callStartMs)}` +
+                                `&from=${encodeURIComponent(currentCallerPhone || '')}`;
+
 
                             const ownerScreenUrl =
                                 `${currentPublicBaseUrl}/owner-screen?parent=${encodeURIComponent(currentCallSid)}`;
 
+
                             const transferTwiml =
 `<Response>
+
     <Dial
         answerOnBridge="true"
         timeout="20"
@@ -1269,42 +1800,45 @@ fastify.register(
             method="POST">${escapeXml(OWNER_PHONE_NUMBER)}</Number>
 
     </Dial>
+
 </Response>`;
+
 
                             await updateTwilioCall(
                                 currentCallSid,
-
                                 {
                                     Twiml:
                                         transferTwiml
                                 }
                             );
 
+
                             console.log(
                                 `Transfer started for ${currentCallSid}`
                             );
 
-                        } catch (error) {
+
+                        } catch (
+                            error
+                        ) {
 
                             transferInProgress =
                                 false;
+
 
                             console.error(
                                 'Human transfer error:',
                                 error
                             );
 
-                            send({
 
-                                type:
-                                    'session.commentary.append',
+                            speakCommentary(
 
-                                delegation_id:
-                                    null,
+                                "I'm sorry, I couldn't start the transfer. I'll make a note that you asked for a callback.",
 
-                                content:
-                                    "I'm sorry, I couldn't start the transfer. I'll make a note that you asked for a callback."
-                            });
+                                'transfer-error'
+                            );
+
 
                             scheduleAiTimers();
                         }
@@ -1312,277 +1846,375 @@ fastify.register(
 
 
                 // --------------------------------------
-                // SILENCE + 5 MINUTE LIMIT
+                // SILENCE
                 // --------------------------------------
 
-                const scheduleAiTimers =
+                const cancelSilenceCycle =
+                    (
+                        interruptAudio =
+                            false
+                    ) => {
+
+                        const oldCycle =
+                            activeSilenceCycle;
+
+
+                        if (
+                            oldCycle !==
+                            null
+                        ) {
+
+                            clearHangupPurpose(
+                                `silence-goodbye:${oldCycle}`
+                            );
+                        }
+
+
+                        activeSilenceCycle =
+                            null;
+
+                        silencePhase =
+                            'none';
+
+                        silencePromptRequestedAt =
+                            0;
+
+                        silencePromptFinishedAt =
+                            0;
+
+
+                        if (
+                            interruptAudio
+                        ) {
+
+                            clearTwilioAudio();
+                        }
+                    };
+
+
+                const startSilenceCheck =
                     () => {
 
-                        clearAiTimers();
+                        silenceCycle +=
+                            1;
 
-                        const now =
+
+                        activeSilenceCycle =
+                            silenceCycle;
+
+
+                        silencePhase =
+                            'waiting_playback';
+
+
+                        silencePromptRequestedAt =
                             Date.now();
 
-                        const elapsed =
-                            Math.max(
-                                0,
-                                now - callStartMs
-                            );
 
-                        const warningDelay =
-                            MAX_CALL_WARNING_MS -
-                            elapsed;
-
-                        const closingDelay =
-                            MAX_CALL_CLOSING_MS -
-                            elapsed;
-
-                        const hardDelay =
-                            MAX_AI_CALL_MS -
-                            elapsed;
+                        console.log(
+                            '25 seconds of customer silence'
+                        );
 
 
-                        // 4:50 warning
+                        speakCommentary(
+
+                            'Are you still there?',
+
+                            `silence-check:${activeSilenceCycle}`
+                        );
+                    };
+
+
+                const startSilenceHangup =
+                    () => {
 
                         if (
-                            warningDelay > 0
+                            activeSilenceCycle ===
+                            null
                         ) {
-
-                            maxWarningTimer =
-                                setTimeout(
-                                    () => {
-
-                                        if (
-                                            transferInProgress ||
-                                            shuttingDown ||
-                                            twilioHangupRequested ||
-                                            customerRequestedEnd
-                                        ) {
-
-                                            return;
-                                        }
-
-                                        send({
-
-                                            type:
-                                                'session.commentary.append',
-
-                                            delegation_id:
-                                                null,
-
-                                            content:
-                                                "We're almost at the end of the call. Is there anything else you need?"
-                                        });
-
-                                    },
-                                    warningDelay
-                                );
-                        }
-
-
-                        // 4:56 closing message
-
-                        if (
-                            closingDelay > 0
-                        ) {
-
-                            maxClosingTimer =
-                                setTimeout(
-                                    () => {
-
-                                        if (
-                                            transferInProgress ||
-                                            shuttingDown ||
-                                            twilioHangupRequested
-                                        ) {
-
-                                            return;
-                                        }
-
-                                        send({
-
-                                            type:
-                                                'session.commentary.append',
-
-                                            delegation_id:
-                                                null,
-
-                                            content:
-                                                "I'll go ahead and disconnect the call now. Have a good day."
-                                        });
-
-                                        scheduleHangupAfterAssistant(
-                                            'five-minute-limit',
-                                            3500
-                                        );
-
-                                    },
-                                    closingDelay
-                                );
-                        }
-
-
-                        // Hard 5:00 limit
-
-                        if (
-                            hardDelay <= 0
-                        ) {
-
-                            void endTwilioCall(
-                                'five-minute-hard-limit'
-                            );
 
                             return;
                         }
 
-                        maxHardTimer =
-                            setTimeout(
-                                () => {
 
-                                    void endTwilioCall(
-                                        'five-minute-hard-limit'
-                                    );
-
-                                },
-                                hardDelay
-                            );
+                        const purpose =
+                            `silence-goodbye:${activeSilenceCycle}`;
 
 
-                        // Silence monitor
-
-                        silenceMonitor =
-                            setInterval(
-                                () => {
-
-                                    if (
-                                        !sessionReady ||
-                                        transferInProgress ||
-                                        shuttingDown ||
-                                        twilioHangupRequested ||
-                                        customerRequestedEnd ||
-                                        silenceEnding
-                                    ) {
-
-                                        return;
-                                    }
-
-                                    const currentTime =
-                                        Date.now();
+                        silencePhase =
+                            'ending';
 
 
-                                    // We already asked:
-                                    // "Are you still there?"
-
-                                    if (
-                                        silencePromptActive
-                                    ) {
-
-                                        if (
-                                            lastCustomerSpeechAt >
-                                            silencePromptAskedAt
-                                        ) {
-
-                                            silencePromptActive =
-                                                false;
-
-                                            silencePromptAskedAt =
-                                                0;
-
-                                            console.log(
-                                                'Customer returned after silence check'
-                                            );
-
-                                            return;
-                                        }
+                        console.log(
+                            'Customer silent for another 10 seconds'
+                        );
 
 
-                                        // Another 10 seconds silence
+                        armHangupOnPurpose(
 
-                                        if (
-                                            currentTime -
-                                                silencePromptAskedAt >=
-                                                SILENCE_HANGUP_MS
-                                        ) {
+                            purpose,
 
-                                            silencePromptActive =
-                                                false;
+                            'silence-timeout',
 
-                                            silenceEnding =
-                                                true;
-
-                                            console.log(
-                                                'Customer silent after follow-up'
-                                            );
-
-                                            send({
-
-                                                type:
-                                                    'session.commentary.append',
-
-                                                delegation_id:
-                                                    null,
-
-                                                content:
-                                                    "I'll go ahead and disconnect the call. Have a good day."
-                                            });
-
-                                            scheduleHangupAfterAssistant(
-                                                'silence-timeout',
-                                                4000
-                                            );
-                                        }
-
-                                        return;
-                                    }
+                            6000
+                        );
 
 
-                                    const activityReference =
-                                        Math.max(
-                                            lastCustomerSpeechAt,
-                                            lastAssistantAudioAt,
-                                            callStartMs
-                                        );
+                        speakCommentary(
 
+                            "I'll go ahead and disconnect the call. Have a good day.",
 
-                                    // 25 seconds silence
-
-                                    if (
-                                        currentTime -
-                                            activityReference >=
-                                            SILENCE_CHECK_MS
-                                    ) {
-
-                                        silencePromptActive =
-                                            true;
-
-                                        silencePromptAskedAt =
-                                            currentTime;
-
-                                        console.log(
-                                            '25 seconds of customer silence'
-                                        );
-
-                                        send({
-
-                                            type:
-                                                'session.commentary.append',
-
-                                            delegation_id:
-                                                null,
-
-                                            content:
-                                                'Are you still there?'
-                                        });
-                                    }
-
-                                },
-                                500
-                            );
+                            purpose
+                        );
                     };
 
 
                 // --------------------------------------
-                // START LIVE SESSION
+                // TIMERS
+                // --------------------------------------
+
+                function scheduleAiTimers() {
+
+                    clearAiTimers();
+
+
+                    const elapsed =
+                        Math.max(
+                            0,
+                            Date.now() -
+                                callStartMs
+                        );
+
+
+                    const warningDelay =
+                        MAX_CALL_WARNING_MS -
+                        elapsed;
+
+
+                    const closingDelay =
+                        MAX_CALL_CLOSING_MS -
+                        elapsed;
+
+
+                    const hardDelay =
+                        MAX_AI_CALL_MS -
+                        elapsed;
+
+
+                    if (
+                        warningDelay >
+                        0
+                    ) {
+
+                        maxWarningTimer =
+                            setTimeout(
+                                () => {
+
+                                    if (
+                                        transferInProgress ||
+                                        shuttingDown ||
+                                        twilioHangupRequested ||
+                                        customerRequestedEnd
+                                    ) {
+
+                                        return;
+                                    }
+
+
+                                    speakCommentary(
+
+                                        "We're almost at the end of the call. Is there anything else you need?",
+
+                                        'five-minute-warning'
+                                    );
+
+                                },
+                                warningDelay
+                            );
+                    }
+
+
+                    if (
+                        closingDelay >
+                        0
+                    ) {
+
+                        maxClosingTimer =
+                            setTimeout(
+                                () => {
+
+                                    if (
+                                        transferInProgress ||
+                                        shuttingDown ||
+                                        twilioHangupRequested
+                                    ) {
+
+                                        return;
+                                    }
+
+
+                                    const purpose =
+                                        `five-minute-goodbye:${Date.now()}`;
+
+
+                                    armHangupOnPurpose(
+
+                                        purpose,
+
+                                        'five-minute-limit',
+
+                                        5000
+                                    );
+
+
+                                    speakCommentary(
+
+                                        "I'll go ahead and disconnect the call now. Have a good day.",
+
+                                        purpose
+                                    );
+
+                                },
+                                closingDelay
+                            );
+                    }
+
+
+                    if (
+                        hardDelay <=
+                        0
+                    ) {
+
+                        void endTwilioCall(
+                            'five-minute-hard-limit'
+                        );
+
+                        return;
+                    }
+
+
+                    maxHardTimer =
+                        setTimeout(
+                            () => {
+
+                                void endTwilioCall(
+                                    'five-minute-hard-limit'
+                                );
+
+                            },
+                            hardDelay
+                        );
+
+
+                    silenceMonitor =
+                        setInterval(
+                            () => {
+
+                                if (
+                                    !sessionReady ||
+                                    transferInProgress ||
+                                    shuttingDown ||
+                                    twilioHangupRequested ||
+                                    customerRequestedEnd
+                                ) {
+
+                                    return;
+                                }
+
+
+                                const now =
+                                    Date.now();
+
+
+                                if (
+                                    silencePhase ===
+                                    'waiting_playback'
+                                ) {
+
+                                    if (
+                                        now -
+                                            silencePromptRequestedAt >=
+                                        5000
+                                    ) {
+
+                                        silencePhase =
+                                            'waiting_response';
+
+                                        silencePromptFinishedAt =
+                                            now;
+
+
+                                        console.log(
+                                            'Silence prompt playback mark timeout; starting 10-second wait'
+                                        );
+                                    }
+
+                                    return;
+                                }
+
+
+                                if (
+                                    silencePhase ===
+                                    'waiting_response'
+                                ) {
+
+                                    if (
+                                        now -
+                                            silencePromptFinishedAt >=
+                                        SILENCE_HANGUP_MS
+                                    ) {
+
+                                        startSilenceHangup();
+                                    }
+
+                                    return;
+                                }
+
+
+                                if (
+                                    silencePhase ===
+                                    'ending'
+                                ) {
+
+                                    return;
+                                }
+
+
+                                if (
+                                    !hasAssistantPlaybackEnded ||
+                                    assistantPlaybackBusy
+                                ) {
+
+                                    return;
+                                }
+
+
+                                const activityReference =
+                                    Math.max(
+
+                                        lastCustomerSpeechAt,
+
+                                        lastAssistantPlaybackEndedAt
+                                    );
+
+
+                                if (
+                                    now -
+                                        activityReference >=
+                                    SILENCE_CHECK_MS
+                                ) {
+
+                                    startSilenceCheck();
+                                }
+
+                            },
+                            500
+                        );
+                }
+
+
+                // --------------------------------------
+                // START GPT LIVE
                 // --------------------------------------
 
                 const startSession =
@@ -1598,8 +2230,10 @@ fastify.register(
                             return;
                         }
 
+
                         sessionRequested =
                             true;
+
 
                         send({
 
@@ -1655,6 +2289,7 @@ fastify.register(
                             'Connected to GPT-Live-1'
                         );
 
+
                         startSession();
                     }
                 );
@@ -1667,7 +2302,9 @@ fastify.register(
                 openAiWs.on(
                     'message',
 
-                    (data) => {
+                    (
+                        data
+                    ) => {
 
                         try {
 
@@ -1677,8 +2314,6 @@ fastify.register(
                                 );
 
 
-                            // Session ready
-
                             if (
                                 event.type ===
                                 'session.started'
@@ -1687,14 +2322,17 @@ fastify.register(
                                 sessionReady =
                                     true;
 
+
                                 openAiSessionId =
                                     event.session?.id ||
                                     null;
+
 
                                 console.log(
                                     'GPT-Live-1 session:',
                                     openAiSessionId
                                 );
+
 
                                 const firstLine =
                                     resumeReason ===
@@ -1703,6 +2341,7 @@ fastify.register(
                                         ? "Thanks for waiting. I couldn't connect you right now, but I can keep helping you."
 
                                         : OPENING;
+
 
                                 send({
 
@@ -1716,22 +2355,17 @@ fastify.register(
                                         `Your first spoken line on this call is exactly: "${firstLine}"`
                                 });
 
-                                send({
 
-                                    type:
-                                        'session.commentary.append',
+                                speakCommentary(
 
-                                    delegation_id:
-                                        null,
+                                    firstLine,
 
-                                    content:
-                                        firstLine
-                                });
+                                    'greeting'
+                                );
+
 
                                 scheduleAiTimers();
 
-
-                            // Mia audio
 
                             } else if (
                                 event.type ===
@@ -1743,27 +2377,10 @@ fastify.register(
                                     WebSocket.OPEN
                             ) {
 
-                                lastAssistantAudioAt =
-                                    Date.now();
-
-                                connection.send(
-                                    JSON.stringify({
-
-                                        event:
-                                            'media',
-
-                                        streamSid,
-
-                                        media: {
-
-                                            payload:
-                                                event.delta
-                                        }
-                                    })
+                                noteAssistantAudioChunk(
+                                    event.delta
                                 );
 
-
-                            // Customer transcript
 
                             } else if (
                                 event.type ===
@@ -1775,22 +2392,39 @@ fastify.register(
                                     event.delta
                                 );
 
+
                                 lastCustomerSpeechAt =
                                     Date.now();
 
+
                                 if (
-                                    silencePromptActive
+                                    silencePhase !==
+                                    'none'
                                 ) {
 
-                                    silencePromptActive =
-                                        false;
+                                    const shouldInterrupt =
+                                        silencePhase ===
+                                            'waiting_playback' ||
 
-                                    silencePromptAskedAt =
-                                        0;
+                                        silencePhase ===
+                                            'ending';
+
+
+                                    cancelSilenceCycle(
+                                        shouldInterrupt
+                                    );
+
+
+                                    console.log(
+                                        'Customer returned after silence check'
+                                    );
                                 }
 
+
                                 queueTranscript(
+
                                     'customer',
+
                                     event.delta,
 
                                     event.start_ms ??
@@ -1803,18 +2437,18 @@ fastify.register(
                                         null
                                 );
 
+
                                 customerTextWindow =
                                     (
-                                        customerTextWindow +
-                                        ' ' +
-                                        event.delta
-                                    ).slice(-500);
+                                        `${customerTextWindow} ${event.delta}`
+                                    ).slice(
+                                        -500
+                                    );
 
-
-                                // Goodbye
 
                                 if (
                                     !customerRequestedEnd &&
+
                                     containsExplicitGoodbye(
                                         customerTextWindow
                                     )
@@ -1823,16 +2457,17 @@ fastify.register(
                                     customerTextWindow =
                                         '';
 
+
                                     requestGracefulEnd();
+
 
                                     return;
                                 }
 
 
-                                // Direct request for person
-
                                 if (
                                     !transferInProgress &&
+
                                     containsExplicitHumanRequest(
                                         customerTextWindow
                                     )
@@ -1841,19 +2476,19 @@ fastify.register(
                                     customerTextWindow =
                                         '';
 
+
                                     void requestOwnerTransfer(
                                         'explicit-customer-request'
                                     );
+
 
                                     return;
                                 }
 
 
-                                // Mia offered transfer;
-                                // customer says yes/no
-
                                 if (
                                     !transferInProgress &&
+
                                     assistantOfferedTransferUntil >
                                         Date.now()
                                 ) {
@@ -1867,15 +2502,19 @@ fastify.register(
                                         assistantOfferedTransferUntil =
                                             0;
 
+
                                         customerTextWindow =
                                             '';
+
 
                                         void requestOwnerTransfer(
                                             'accepted-mia-offer'
                                         );
 
+
                                         return;
                                     }
+
 
                                     if (
                                         containsNegative(
@@ -1886,13 +2525,12 @@ fastify.register(
                                         assistantOfferedTransferUntil =
                                             0;
 
+
                                         customerTextWindow =
                                             '';
                                     }
                                 }
 
-
-                            // Assistant transcript
 
                             } else if (
                                 event.type ===
@@ -1904,8 +2542,11 @@ fastify.register(
                                     event.delta
                                 );
 
+
                                 queueTranscript(
+
                                     'assistant',
+
                                     event.delta,
 
                                     event.start_ms ??
@@ -1918,20 +2559,20 @@ fastify.register(
                                         null
                                 );
 
+
                                 assistantTextWindow =
                                     (
-                                        assistantTextWindow +
-                                        ' ' +
-                                        event.delta
-                                    ).slice(-500);
+                                        `${assistantTextWindow} ${event.delta}`
+                                    ).slice(
+                                        -500
+                                    );
+
 
                                 const assistantNormalized =
                                     normalizeForMatch(
                                         assistantTextWindow
                                     );
 
-
-                                // Mia offered transfer
 
                                 if (
                                     /would you like me to connect you (with|to) (someone|a person|the owner|a technician|a manager)/i.test(
@@ -1947,12 +2588,11 @@ fastify.register(
                                         Date.now() +
                                         20_000;
 
+
                                     customerTextWindow =
                                         '';
                                 }
 
-
-                            // Block unwanted delegation
 
                             } else if (
                                 event.type ===
@@ -1963,10 +2603,12 @@ fastify.register(
                                     event.delegation?.id ||
                                     null;
 
+
                                 console.log(
                                     'Delegation blocked:',
                                     delegationId
                                 );
+
 
                                 if (
                                     delegationId
@@ -1989,8 +2631,6 @@ fastify.register(
                                 }
 
 
-                            // OpenAI error
-
                             } else if (
                                 event.type ===
                                     'error'
@@ -2002,7 +2642,10 @@ fastify.register(
                                 );
                             }
 
-                        } catch (error) {
+
+                        } catch (
+                            error
+                        ) {
 
                             console.error(
                                 'OpenAI message error:',
@@ -2020,7 +2663,9 @@ fastify.register(
                 connection.on(
                     'message',
 
-                    async (message) => {
+                    async (
+                        message
+                    ) => {
 
                         try {
 
@@ -2029,8 +2674,6 @@ fastify.register(
                                     message
                                 );
 
-
-                            // Customer audio
 
                             if (
                                 data.event ===
@@ -2052,7 +2695,51 @@ fastify.register(
                                 });
 
 
-                            // Stream started
+                            } else if (
+                                data.event ===
+                                    'mark'
+                            ) {
+
+                                const markName =
+                                    data.mark?.name;
+
+
+                                const purpose =
+                                    markName
+
+                                        ? pendingPlaybackMarks.get(
+                                            markName
+                                        )
+
+                                        : null;
+
+
+                                if (
+                                    markName &&
+                                    purpose
+                                ) {
+
+                                    pendingPlaybackMarks.delete(
+                                        markName
+                                    );
+
+
+                                    completedPlaybackPurposes.push(
+                                        purpose
+                                    );
+                                }
+
+
+                                if (
+                                    pendingPlaybackMarks.size ===
+                                        0 &&
+
+                                    !assistantMarkDebounceTimer
+                                ) {
+
+                                    onAssistantPlaybackFullyDrained();
+                                }
+
 
                             } else if (
                                 data.event ===
@@ -2062,53 +2749,66 @@ fastify.register(
                                 streamSid =
                                     data.start.streamSid;
 
+
                                 currentCallSid =
                                     data.start.callSid ||
                                     null;
+
 
                                 const custom =
                                     data.start
                                         .customParameters ||
                                     {};
 
-                                const callerPhone =
+
+                                currentCallerPhone =
                                     custom.From ||
                                     null;
+
 
                                 currentPublicBaseUrl =
                                     custom.BaseUrl ||
                                     null;
+
 
                                 const parsedStart =
                                     Number(
                                         custom.CallStartMs
                                     );
 
+
                                 callStartMs =
                                     Number.isFinite(
                                         parsedStart
                                     ) &&
-                                    parsedStart > 0
+                                    parsedStart >
+                                        0
 
                                         ? parsedStart
+
                                         : Date.now();
+
 
                                 resumeReason =
                                     custom.ResumeReason ||
                                     null;
 
+
                                 lastCustomerSpeechAt =
                                     Date.now();
+
 
                                 console.log(
                                     'Incoming Twilio stream:',
                                     streamSid
                                 );
 
+
                                 console.log(
                                     'Twilio Call SID:',
                                     currentCallSid
                                 );
+
 
                                 if (
                                     resumeReason
@@ -2120,27 +2820,28 @@ fastify.register(
                                     );
                                 }
 
+
                                 startSession();
 
-
-                                // CRM
 
                                 try {
 
                                     if (
-                                        !callerPhone
+                                        !currentCallerPhone
                                     ) {
 
                                         console.error(
                                             'Caller phone number was not received'
                                         );
 
+
                                     } else {
 
                                         const customer =
                                             await findOrCreateCustomer(
-                                                callerPhone
+                                                currentCallerPhone
                                             );
+
 
                                         const job =
                                             await createJobForCall({
@@ -2152,17 +2853,23 @@ fastify.register(
                                                     currentCallSid
                                             });
 
+
                                         currentJobNumber =
                                             job.job_number;
+
 
                                         console.log(
                                             `CRM job ready: #${job.job_number}`
                                         );
 
+
                                         await flushTranscript();
                                     }
 
-                                } catch (error) {
+
+                                } catch (
+                                    error
+                                ) {
 
                                     console.error(
                                         'CRM create job error:',
@@ -2170,8 +2877,6 @@ fastify.register(
                                     );
                                 }
 
-
-                            // Stream stopped
 
                             } else if (
                                 data.event ===
@@ -2184,7 +2889,10 @@ fastify.register(
                                 );
                             }
 
-                        } catch (error) {
+
+                        } catch (
+                            error
+                        ) {
 
                             console.error(
                                 'Twilio message error:',
@@ -2196,7 +2904,7 @@ fastify.register(
 
 
                 // --------------------------------------
-                // TWILIO CLOSED
+                // SOCKET CLOSE
                 // --------------------------------------
 
                 connection.on(
@@ -2209,6 +2917,7 @@ fastify.register(
                             true
                         );
 
+
                         console.log(
                             'Caller disconnected'
                         );
@@ -2219,12 +2928,15 @@ fastify.register(
                 connection.on(
                     'error',
 
-                    (error) => {
+                    (
+                        error
+                    ) => {
 
                         console.error(
                             'Twilio WebSocket error:',
                             error
                         );
+
 
                         void shutdown(
                             'twilio-error',
@@ -2233,10 +2945,6 @@ fastify.register(
                     }
                 );
 
-
-                // --------------------------------------
-                // OPENAI CLOSED
-                // --------------------------------------
 
                 openAiWs.on(
                     'close',
@@ -2247,10 +2955,14 @@ fastify.register(
                     ) => {
 
                         console.log(
+
                             'Disconnected from GPT-Live-1',
+
                             closeCode,
+
                             reason.toString()
                         );
+
 
                         void shutdown(
                             'openai-close',
@@ -2263,12 +2975,15 @@ fastify.register(
                 openAiWs.on(
                     'error',
 
-                    (error) => {
+                    (
+                        error
+                    ) => {
 
                         console.error(
                             'OpenAI WebSocket error:',
                             error
                         );
+
 
                         void shutdown(
                             'openai-error',
@@ -2292,6 +3007,7 @@ async function start() {
 
         await initDatabase();
 
+
         await fastify.listen({
 
             port:
@@ -2301,19 +3017,27 @@ async function start() {
                 '0.0.0.0'
         });
 
+
         console.log(
             `AI Call Center listening on port ${PORT}`
         );
 
-    } catch (error) {
+
+    } catch (
+        error
+    ) {
 
         console.error(
             'Startup error:',
             error
         );
 
-        process.exit(1);
+
+        process.exit(
+            1
+        );
     }
 }
+
 
 start();
