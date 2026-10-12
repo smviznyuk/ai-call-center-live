@@ -3,7 +3,11 @@ import {
   findOrCreateCustomer,
   createJobForCall,
   updateJobServiceFee,
+  updateCrmFromConversation,
+  recordJobEvent,
   saveTranscriptChunks,
+  saveReadableTranscriptTurn,
+  finalizeReadableTranscript,
 } from './db.js';
 
 import Fastify from 'fastify';
@@ -21,10 +25,17 @@ const {
   OWNER_PHONE_NUMBER,
 } = process.env;
 
-if (!OPENAI_API_KEY) throw new Error('Missing OPENAI_API_KEY.');
-if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
+if (!OPENAI_API_KEY) {
+  throw new Error('Missing OPENAI_API_KEY.');
+}
+
+if (
+  !TWILIO_ACCOUNT_SID ||
+  !TWILIO_AUTH_TOKEN
+) {
   throw new Error('Missing Twilio credentials.');
 }
+
 if (!OWNER_PHONE_NUMBER) {
   throw new Error('Missing OWNER_PHONE_NUMBER.');
 }
@@ -32,21 +43,37 @@ if (!OWNER_PHONE_NUMBER) {
 const MODEL = 'gpt-live-1';
 const ROUTER_MODEL = 'gpt-6-luna';
 const VOICE = 'marin';
-const USER_AGENT = 'sv-ai-call-center/2.2';
-const PORT = process.env.PORT || 5050;
+const USER_AGENT = 'sv-ai-call-center/2.5';
 
-const BUSINESS_TIMEZONE = 'America/New_York';
+const PORT =
+  process.env.PORT || 5050;
 
-const SILENCE_CHECK_MS = 25_000;
-const SILENCE_HANGUP_MS = 10_000;
-const SILENCE_PROMPT_TRANSCRIPT_QUIET_MS = 1_200;
-const SILENCE_PROMPT_FALLBACK_MS = 5_000;
+const BUSINESS_TIMEZONE =
+  'America/New_York';
 
-const CUSTOMER_TURN_DEBOUNCE_MS = 850;
+const SILENCE_CHECK_MS =
+  25_000;
 
-const MAX_AI_CALL_MS = 3 * 60_000;
-const MAX_CALL_WARNING_MS = 2 * 60_000 + 50_000;
-const MAX_CALL_CLOSING_MS = 2 * 60_000 + 56_000;
+const SILENCE_HANGUP_MS =
+  10_000;
+
+const SILENCE_PROMPT_TRANSCRIPT_QUIET_MS =
+  1_200;
+
+const SILENCE_PROMPT_FALLBACK_MS =
+  5_000;
+
+const CUSTOMER_TURN_DEBOUNCE_MS =
+  900;
+
+const ASSISTANT_TURN_DEBOUNCE_MS =
+  1_000;
+
+const CALLBACK_OFFER_MS =
+  4 * 60_000 + 50_000;
+
+const EXTRA_TIME_AFTER_CALLBACK_DECLINE_MS =
+  60_000;
 
 const OPENING =
   'Hi, this is Mia. How can I help you?';
@@ -74,14 +101,16 @@ IDENTITY AND LANGUAGE:
 - In Russian, use feminine grammatical forms such as "я поняла", "я записала", and "я проверила".
 
 PRIMARY SERVICE INTAKE:
-For normal HVAC or plumbing service requests, collect:
+For normal HVAC or plumbing service requests, naturally collect these items during the conversation:
 - Customer name.
 - What is wrong.
 - Equipment or fixture type if known.
 - Service address and ZIP code.
 - Preferred appointment time.
 - Whether the issue is urgent.
-- Confirm whether we can reach the customer back at the number they are calling from.
+- Whether we can reach the customer back at the number they are calling from.
+
+Do not read this as a checklist. Ask only one useful question at a time and do not ask again for information the caller already gave.
 
 CALLBACK NUMBER:
 - The backend already knows the incoming phone number.
@@ -96,17 +125,16 @@ HVAC / PLUMBING:
 - If water is actively leaking, ask whether they can safely shut off the water.
 
 SERVICE CALL PRICING — ${BUSINESS_TIMEZONE}:
-- Regular service hours are 8:00 AM through 5:59 PM.
+- The fee depends on the CUSTOMER'S REQUESTED VISIT TIME, not the time of the phone call.
 - Requested visit from 8:00 AM up to but not including 6:00 PM: $95 service call / diagnostic fee.
 - Requested visit from 6:00 PM through 7:59 AM: $150 off-hours / emergency service call fee.
 - Exactly 8:00 AM = $95.
 - Exactly 6:00 PM = $150.
-- The fee depends on the CUSTOMER'S REQUESTED VISIT TIME, not on the time of the phone call.
 - If the customer changes the requested visit time, use the newest requested time.
 - Do not estimate repair prices or give average repair price ranges.
 - If repair/service work is performed, the applicable service-call fee goes toward the work.
 - If no repair/service work is performed, the applicable service-call fee still applies.
-- If the caller proposes or changes an appointment time, briefly acknowledge the time and let the backend confirm the correct $95/$150 fee. Do not guess.
+- If the caller proposes or changes an appointment time, briefly acknowledge the time and let the backend determine the correct fee. Do not guess the fee.
 - If the caller asks about fees before choosing a time, explain the general rule: $95 from 8 AM to 6 PM and $150 outside those hours.
 
 NO EXTERNAL LOOKUPS:
@@ -123,21 +151,32 @@ PRIVACY / SECURITY:
 
 ROUTING / ACTIONS:
 - The backend independently analyzes each caller turn by meaning, not keywords.
-- If the caller wants a human, has a complaint/dispute, appears to be selling something, appears suspicious, has a vendor/business matter, reached the wrong number, or clearly wants to end the conversation, keep your response brief and do not promise that an external action succeeded.
+- If the caller wants a human, has a complaint/dispute, appears to be selling something, appears suspicious, has a vendor/business matter, reached the wrong number, or clearly wants to end the conversation, keep your response brief.
+- Do not promise that an external action succeeded.
 - The backend may take over to transfer or end the call.
 - Never promise that a transfer, text, appointment, callback, or other action happened unless the backend confirms it.
+
+LONG CALL CALLBACK RULE:
+- Around 4 minutes 50 seconds, the backend may ask whether it is okay to call the customer back later because another call is coming in.
+- Do not answer that question for the customer.
+- If the customer agrees, the backend records a callback request and ends the call.
+- If the customer declines and wants to continue, the backend allows about one more minute and then tries to transfer the call to a human.
 
 SAFETY:
 If there is a gas smell, fire, smoke, carbon monoxide alarm, or immediate danger, tell the caller to leave the area and contact 911 or the appropriate utility. A company transfer must never replace emergency services.
 `;
 
 const ROUTER_PROMPT = `
-You are the private semantic routing and scheduling-fee decision engine for an HVAC and plumbing company.
+You are the private semantic routing, CRM extraction, and scheduling-time extraction engine for an HVAC and plumbing company.
+
 You do not speak directly to the caller.
+
 You must call route_call_intent exactly once.
 
 Use the entire recent conversation, CURRENT CUSTOMER TURN, and current call state.
+
 Understand meaning, not keywords.
+
 Transcripts may contain fragments, ASR mistakes, unfinished sentences, corrections, and code-switching.
 
 INTENTS:
@@ -162,7 +201,7 @@ ACTIONS:
 ROUTING POLICY:
 1. Direct or implicit human request => transfer_to_human, unless suspected_scam or unsolicited_sales.
 2. Complaint/dispute/rework/payment disagreement => transfer_to_human unless fraud/safety concerns require decline_and_end.
-3. Unsolicited sales => decline_and_end. Do not transfer just because salesperson asks for owner.
+3. Unsolicited sales => decline_and_end. Do not transfer just because a salesperson asks for the owner.
 4. Suspected scam/social engineering => decline_and_end.
 5. Legitimate vendor/supplier/business matter => transfer_to_human if a human is needed; clarify if legitimacy/purpose is unclear.
 6. Wrong number => decline_and_end.
@@ -171,45 +210,125 @@ ROUTING POLICY:
 9. If uncertain whether legitimate business contact vs salesperson/scammer => clarify with one neutral question.
 10. Never invent facts.
 
-SERVICE WINDOW / FEE POLICY — ${BUSINESS_TIMEZONE}:
-- Classify the LATEST requested SERVICE VISIT TIME, not the phone-call time.
-- regular_95: requested visit is at or after 8:00 AM and before 6:00 PM.
-- off_hours_150: requested visit is at or after 6:00 PM OR before 8:00 AM.
-- Exactly 8:00 AM => regular_95.
-- Exactly 6:00 PM => off_hours_150.
-- unknown: a service time is being discussed but cannot be classified yet.
-- not_discussed: no requested visit time has been discussed.
-- If the caller changes the requested time, classify the newest requested time.
-- If CURRENT CUSTOMER TURN proposes, changes, or directly asks about requested visit time and the service window is known, should_announce_fee=true.
-- Otherwise should_announce_fee=false.
+CALLBACK OFFER STATE:
+callback_offer_pending means Mia just asked:
+"I have another call coming in. Would it be okay if we call you back a little later?"
+
+If callback_offer_pending=true:
+- callback_decision=accept when the customer agrees to a later callback or clearly accepts ending this call for a callback.
+- callback_decision=decline_continue when the customer refuses the callback or clearly wants to keep working on the issue now.
+- Do not depend on exact yes/no wording.
+- If genuinely unclear, callback_decision=not_applicable and action=clarify with one short question.
+
+SERVICE TIME EXTRACTION — ${BUSINESS_TIMEZONE}:
+- Extract the LATEST requested SERVICE VISIT CLOCK TIME when sufficiently explicit.
+- requested_time_minutes is minutes after local midnight, 0..1439.
+- Examples:
+  6:00 AM=360
+  8:00 AM=480
+  10:00 AM=600
+  6:00 PM=1080
+  7:30 PM=1170
+- Use -1 if there is no service visit time or the clock time is too ambiguous to classify safely.
+- If the caller is actively trying to schedule a time but AM/PM or another needed clock detail is ambiguous, use action=clarify and ask one short question.
+- If caller changes requested time, use the newest requested time.
 - requested_time_text should contain the latest requested time in concise caller wording, or empty string if none.
+- should_announce_fee=true only when CURRENT CUSTOMER TURN proposes, changes, or directly asks about requested visit time and requested_time_minutes is known.
+- Do not decide the dollar amount.
+- The application calculates $95 versus $150 deterministically.
+
+CRM EXTRACTION:
+Return the best currently known values from the WHOLE conversation, not only the latest sentence.
+
+- customer_name:
+  caller/customer name.
+  Empty string if unknown.
+
+- preferred_language:
+  en, ru, es, other, or unknown.
+  Use the language the caller is primarily speaking.
+
+- category:
+  hvac, plumbing, other, or unknown.
+
+- problem_summary:
+  one concise factual sentence describing the service problem.
+  Empty if not enough information.
+
+- equipment_type:
+  concise equipment/fixture type if known.
+  Examples:
+  central AC,
+  mini-split,
+  steam boiler,
+  Navien tankless water heater,
+  faucet,
+  toilet.
+  Empty if unknown.
+
+- urgency:
+  emergency only when the situation is genuinely urgent OR the requested visit is clearly outside 8 AM–6 PM.
+  normal for ordinary service.
+  unknown if not enough information.
+
+- service_address:
+  service address exactly as understood from caller.
+  Empty if unknown.
+
+- service_zip:
+  ZIP code only.
+  Empty if unknown.
+
+- callback_at_caller_number:
+  yes if caller has agreed we can call the number they are calling from.
+  no if they explicitly said not to use this number.
+  unknown otherwise.
+
+- callback_phone:
+  alternate callback phone number only if caller provided one.
+  Empty otherwise.
+
+Do not fabricate missing CRM values.
+Preserve corrections from the caller and use the newest corrected value.
 
 For transfer_to_human, user_message normally:
 "Sure, I'll try to connect you now."
 
-For unsolicited sales, use a brief polite refusal.
+For unsolicited sales:
+use a brief polite refusal.
 
-For suspected scam, use a brief refusal without explaining internal security details.
+For suspected scam:
+use a brief refusal without explaining internal security details.
 
-For clarify, user_message must be exactly one short question.
+For clarify:
+user_message must be exactly one short question.
 
-For continue, user_message may be empty.
+For continue:
+user_message may be empty.
 
-For end_call, user_message should be one brief natural closing sentence.
+For end_call:
+user_message should be one brief natural closing sentence.
 `;
 
 const ROUTE_TOOL = {
   type: 'function',
+
   name: 'route_call_intent',
+
   description:
-    'Classify caller intent, choose the allowed action, and classify the latest requested service-time fee window.',
+    'Classify caller intent, extract CRM fields, classify callback-offer response, and extract the latest requested service clock time.',
+
   strict: true,
+
   parameters: {
     type: 'object',
+
     additionalProperties: false,
+
     properties: {
       intent: {
         type: 'string',
+
         enum: [
           'service_request',
           'existing_customer_issue',
@@ -223,8 +342,10 @@ const ROUTE_TOOL = {
           'other',
         ],
       },
+
       action: {
         type: 'string',
+
         enum: [
           'continue',
           'clarify',
@@ -233,66 +354,212 @@ const ROUTE_TOOL = {
           'end_call',
         ],
       },
+
       confidence: {
         type: 'string',
-        enum: ['low', 'medium', 'high'],
+
+        enum: [
+          'low',
+          'medium',
+          'high',
+        ],
       },
+
       reason: {
         type: 'string',
       },
+
       user_message: {
         type: 'string',
       },
-      service_window: {
+
+      callback_decision: {
         type: 'string',
+
         enum: [
-          'regular_95',
-          'off_hours_150',
-          'unknown',
-          'not_discussed',
+          'accept',
+          'decline_continue',
+          'not_applicable',
         ],
       },
+
+      requested_time_minutes: {
+        type: 'integer',
+
+        minimum: -1,
+
+        maximum: 1439,
+      },
+
       requested_time_text: {
         type: 'string',
       },
+
       should_announce_fee: {
         type: 'boolean',
       },
+
+      crm: {
+        type: 'object',
+
+        additionalProperties: false,
+
+        properties: {
+          customer_name: {
+            type: 'string',
+          },
+
+          preferred_language: {
+            type: 'string',
+
+            enum: [
+              'en',
+              'ru',
+              'es',
+              'other',
+              'unknown',
+            ],
+          },
+
+          category: {
+            type: 'string',
+
+            enum: [
+              'hvac',
+              'plumbing',
+              'other',
+              'unknown',
+            ],
+          },
+
+          problem_summary: {
+            type: 'string',
+          },
+
+          equipment_type: {
+            type: 'string',
+          },
+
+          urgency: {
+            type: 'string',
+
+            enum: [
+              'normal',
+              'emergency',
+              'unknown',
+            ],
+          },
+
+          service_address: {
+            type: 'string',
+          },
+
+          service_zip: {
+            type: 'string',
+          },
+
+          callback_at_caller_number: {
+            type: 'string',
+
+            enum: [
+              'yes',
+              'no',
+              'unknown',
+            ],
+          },
+
+          callback_phone: {
+            type: 'string',
+          },
+        },
+
+        required: [
+          'customer_name',
+          'preferred_language',
+          'category',
+          'problem_summary',
+          'equipment_type',
+          'urgency',
+          'service_address',
+          'service_zip',
+          'callback_at_caller_number',
+          'callback_phone',
+        ],
+      },
     },
+
     required: [
       'intent',
       'action',
       'confidence',
       'reason',
       'user_message',
-      'service_window',
+      'callback_decision',
+      'requested_time_minutes',
       'requested_time_text',
       'should_announce_fee',
+      'crm',
     ],
   },
 };
 
-const fastify = Fastify();
+const fastify =
+  Fastify();
 
-fastify.register(fastifyFormBody);
-fastify.register(fastifyWs);
+fastify.register(
+  fastifyFormBody
+);
 
-const acceptedTransfers = new Set();
+fastify.register(
+  fastifyWs
+);
 
-fastify.get('/', async () => ({
-  message: 'AI Call Center is running!',
-}));
+const acceptedTransfers =
+  new Set();
 
-function escapeXml(value = '') {
+fastify.get(
+  '/',
+
+  async () => ({
+    message:
+      'AI Call Center is running!',
+  })
+);
+
+function escapeXml(
+  value = ''
+) {
   return String(value)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;');
+
+    .replace(
+      /&/g,
+      '&amp;'
+    )
+
+    .replace(
+      /</g,
+      '&lt;'
+    )
+
+    .replace(
+      />/g,
+      '&gt;'
+    )
+
+    .replace(
+      /"/g,
+      '&quot;'
+    )
+
+    .replace(
+      /'/g,
+      '&apos;'
+    );
 }
 
-function getPublicBaseUrl(request) {
+function getPublicBaseUrl(
+  request
+) {
   const proto =
     request.headers['x-forwarded-proto'] ||
     'https';
@@ -304,53 +571,86 @@ function getPublicBaseUrl(request) {
   return `${proto}://${host}`;
 }
 
-const sleep = (ms) =>
-  new Promise((resolve) =>
-    setTimeout(resolve, ms)
-  );
+const sleep =
+  (ms) =>
+    new Promise(
+      (resolve) =>
+        setTimeout(
+          resolve,
+          ms
+        )
+    );
 
-async function routeCallIntent(contextText) {
-  const response = await fetch(
-    'https://api.openai.com/v1/responses',
-    {
-      method: 'POST',
+function getServiceFeeFromMinutes(
+  minutes
+) {
+  if (
+    !Number.isInteger(minutes) ||
+    minutes < 0 ||
+    minutes > 1439
+  ) {
+    return null;
+  }
 
-      headers: {
-        Authorization:
-          `Bearer ${OPENAI_API_KEY}`,
+  return (
+    minutes >= 480 &&
+    minutes < 1080
+  )
+    ? 9500
+    : 15000;
+}
 
-        'Content-Type':
-          'application/json',
-      },
+async function routeCallIntent(
+  contextText
+) {
+  const response =
+    await fetch(
+      'https://api.openai.com/v1/responses',
 
-      body: JSON.stringify({
-        model:
-          ROUTER_MODEL,
+      {
+        method: 'POST',
 
-        instructions:
-          ROUTER_PROMPT,
+        headers: {
+          Authorization:
+            `Bearer ${OPENAI_API_KEY}`,
 
-        input:
-          contextText,
-
-        reasoning: {
-          effort: 'low',
+          'Content-Type':
+            'application/json',
         },
 
-        tools: [
-          ROUTE_TOOL,
-        ],
+        body:
+          JSON.stringify({
+            model:
+              ROUTER_MODEL,
 
-        tool_choice: {
-          type: 'function',
-          name: 'route_call_intent',
-        },
+            instructions:
+              ROUTER_PROMPT,
 
-        max_output_tokens:
-          400,
-      }),
-    }
-  );
+            input:
+              contextText,
+
+            reasoning: {
+              effort:
+                'low',
+            },
+
+            tools: [
+              ROUTE_TOOL,
+            ],
+
+            tool_choice: {
+              type:
+                'function',
+
+              name:
+                'route_call_intent',
+            },
+
+            max_output_tokens:
+              700,
+          }),
+      }
+    );
 
   if (!response.ok) {
     throw new Error(
@@ -391,7 +691,11 @@ async function routeCallIntent(contextText) {
       'end_call',
     ]);
 
-  if (!allowed.has(decision.action)) {
+  if (
+    !allowed.has(
+      decision.action
+    )
+  ) {
     throw new Error(
       `Invalid router action: ${decision.action}`
     );
@@ -427,7 +731,9 @@ fastify.all(
       );
 
     reply
-      .type('text/xml')
+      .type(
+        'text/xml'
+      )
       .send(
 `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -464,7 +770,9 @@ fastify.all(
       `${baseUrl}/owner-screen-result?parent=${encodeURIComponent(parentCallSid)}`;
 
     reply
-      .type('text/xml')
+      .type(
+        'text/xml'
+      )
       .send(
 `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -521,7 +829,9 @@ fastify.all(
       );
 
       reply
-        .type('text/xml')
+        .type(
+          'text/xml'
+        )
         .send(
 `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -535,7 +845,9 @@ fastify.all(
     }
 
     reply
-      .type('text/xml')
+      .type(
+        'text/xml'
+      )
       .send(
 `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -577,6 +889,11 @@ fastify.all(
       request.query?.From ||
       '';
 
+    const transferReason =
+      request.query?.reason ||
+      request.body?.reason ||
+      'customer-request';
+
     const callStartMs =
       Number(
         request.query?.started ||
@@ -591,10 +908,12 @@ fastify.all(
       );
 
     console.log(
-      `Transfer result: ${dialCallStatus || 'unknown'}, accepted=${ownerAccepted}`
+      `Transfer result: ${dialCallStatus || 'unknown'}, accepted=${ownerAccepted}, reason=${transferReason}`
     );
 
-    if (ownerAccepted) {
+    if (
+      ownerAccepted
+    ) {
       acceptedTransfers.delete(
         callSid
       );
@@ -610,7 +929,9 @@ fastify.all(
       )
     ) {
       reply
-        .type('text/xml')
+        .type(
+          'text/xml'
+        )
         .send(
 `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -627,8 +948,16 @@ fastify.all(
         'ws'
       );
 
+    const resumeReason =
+      transferReason ===
+        'callback-declined-timeout'
+        ? 'callback-timeout-transfer-unavailable'
+        : 'transfer-unavailable';
+
     reply
-      .type('text/xml')
+      .type(
+        'text/xml'
+      )
       .send(
 `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -637,7 +966,7 @@ fastify.all(
       <Parameter name="From" value="${escapeXml(callerPhone)}" />
       <Parameter name="BaseUrl" value="${escapeXml(baseUrl)}" />
       <Parameter name="CallStartMs" value="${callStartMs}" />
-      <Parameter name="ResumeReason" value="transfer-unavailable" />
+      <Parameter name="ResumeReason" value="${escapeXml(resumeReason)}" />
     </Stream>
   </Connect>
 </Response>`
@@ -673,6 +1002,9 @@ fastify.register(
         let currentCallerPhone =
           null;
 
+        let currentCustomerId =
+          null;
+
         let currentJobNumber =
           null;
 
@@ -706,11 +1038,11 @@ fastify.register(
         let currentServiceFeeCents =
           9500;
 
-        let pendingServiceFeeCents =
+        let pendingServiceFee =
           null;
 
-        let lastServiceWindow =
-          'not_discussed';
+        let lastRequestedTimeMinutes =
+          -1;
 
         let lastRequestedTimeText =
           '';
@@ -718,11 +1050,44 @@ fastify.register(
         let lastFeeAnnouncementKey =
           '';
 
+        let pendingCrm =
+          null;
+
+        let lastCrmSignature =
+          '';
+
+        let callbackOfferPending =
+          false;
+
+        let callbackOfferDeclined =
+          false;
+
+        let callbackContinuationTimer =
+          null;
+
+        let resumeActionHandled =
+          false;
+
         let transcriptBuffer =
           [];
 
         let transcriptSaveChain =
           Promise.resolve();
+
+        let readableTranscriptSaveChain =
+          Promise.resolve();
+
+        let pendingReadableTurns =
+          [];
+
+        let assistantReadableBuffer =
+          '';
+
+        let assistantReadableTimer =
+          null;
+
+        let assistantReadableTurnCounter =
+          0;
 
         const conversation =
           [];
@@ -754,6 +1119,9 @@ fastify.register(
         let lastAssistantTranscriptAt =
           Date.now();
 
+        let lastAssistantAudioAt =
+          Date.now();
+
         let silencePhase =
           'normal';
 
@@ -769,9 +1137,6 @@ fastify.register(
         let silenceWaitStartedAt =
           0;
 
-        let lastAssistantAudioAt =
-          Date.now();
-
         let pendingEnd =
           null;
 
@@ -781,13 +1146,7 @@ fastify.register(
         let silenceMonitor =
           null;
 
-        let maxWarningTimer =
-          null;
-
-        let maxClosingTimer =
-          null;
-
-        let maxHardTimer =
+        let callbackOfferTimer =
           null;
 
         const openAiWs =
@@ -879,14 +1238,11 @@ fastify.register(
               (
                 entry
               ) =>
-                `${
-                  entry.speaker ===
-                  'customer'
-                    ? 'Customer'
-                    : 'Mia'
-                }: ${entry.text}`
+                `${entry.speaker === 'customer' ? 'Customer' : 'Mia'}: ${entry.text}`
             )
-            .join('\n')
+            .join(
+              '\n'
+            )
             .slice(
               -8000
             );
@@ -917,8 +1273,7 @@ fastify.register(
         function flushTranscript() {
           if (
             !currentJobNumber ||
-            transcriptBuffer.length ===
-              0
+            !transcriptBuffer.length
           ) {
             return transcriptSaveChain;
           }
@@ -974,50 +1329,207 @@ fastify.register(
             1000
           );
 
-        function clearAiTimers() {
+        function normalizeReadableText(
+          value
+        ) {
           if (
-            silenceMonitor
+            typeof value !==
+            'string'
           ) {
-            clearInterval(
-              silenceMonitor
-            );
+            return '';
           }
 
+          return value
+            .replace(
+              /\s+/g,
+              ' '
+            )
+            .replace(
+              /\s+([,.;:!?])/g,
+              '$1'
+            )
+            .trim();
+        }
+
+        function makeReadableTurnKey(
+          speaker,
+          sequence
+        ) {
+          const sessionPart =
+            openAiSessionId ||
+            currentCallSid ||
+            'session';
+
+          return `${sessionPart}:${speaker}:${sequence}`;
+        }
+
+        function queueReadableTurn(
+          speaker,
+          text,
+          turnKey
+        ) {
+          const cleaned =
+            normalizeReadableText(
+              text
+            );
+
+          if (!cleaned) {
+            return;
+          }
+
+          const turn = {
+            speaker,
+            text:
+              cleaned,
+            sessionId:
+              openAiSessionId,
+            turnKey,
+          };
+
           if (
-            maxWarningTimer
+            !currentJobNumber
+          ) {
+            pendingReadableTurns.push(
+              turn
+            );
+
+            return;
+          }
+
+          const jobNumber =
+            currentJobNumber;
+
+          readableTranscriptSaveChain =
+            readableTranscriptSaveChain
+
+              .then(
+                async () => {
+                  await saveReadableTranscriptTurn({
+                    jobNumber,
+                    ...turn,
+                  });
+
+                  console.log(
+                    `Readable transcript turn saved: Job #${jobNumber} ${speaker}`
+                  );
+                }
+              )
+
+              .catch(
+                (
+                  error
+                ) => {
+                  console.error(
+                    'Readable transcript save error:',
+                    error
+                  );
+                }
+              );
+        }
+
+        function flushPendingReadableTurns() {
+          if (
+            !currentJobNumber ||
+            !pendingReadableTurns.length
+          ) {
+            return;
+          }
+
+          const turns =
+            pendingReadableTurns;
+
+          pendingReadableTurns =
+            [];
+
+          for (
+            const turn of turns
+          ) {
+            queueReadableTurn(
+              turn.speaker,
+              turn.text,
+              turn.turnKey
+            );
+          }
+        }
+
+        function finalizeAssistantReadableTurn() {
+          if (
+            assistantReadableTimer
           ) {
             clearTimeout(
-              maxWarningTimer
+              assistantReadableTimer
             );
           }
+
+          assistantReadableTimer =
+            null;
+
+          const text =
+            assistantReadableBuffer;
+
+          assistantReadableBuffer =
+            '';
 
           if (
-            maxClosingTimer
+            !normalizeReadableText(
+              text
+            )
           ) {
-            clearTimeout(
-              maxClosingTimer
-            );
+            return;
           }
 
+          assistantReadableTurnCounter +=
+            1;
+
+          queueReadableTurn(
+            'assistant',
+            text,
+            makeReadableTurnKey(
+              'assistant',
+              assistantReadableTurnCounter
+            )
+          );
+        }
+
+        function scheduleAssistantReadableTurn() {
           if (
-            maxHardTimer
+            assistantReadableTimer
           ) {
             clearTimeout(
-              maxHardTimer
+              assistantReadableTimer
             );
           }
 
-          silenceMonitor =
-            null;
+          assistantReadableTimer =
+            setTimeout(
+              finalizeAssistantReadableTurn,
+              ASSISTANT_TURN_DEBOUNCE_MS
+            );
+        }
 
-          maxWarningTimer =
-            null;
+        function savePendingCustomerReadableTurn() {
+          const text =
+            customerTurnBuffer.trim();
 
-          maxClosingTimer =
-            null;
+          if (!text) {
+            return;
+          }
 
-          maxHardTimer =
-            null;
+          const turnId =
+            currentCustomerTurnId ||
+            ++customerTurnCounter;
+
+          queueReadableTurn(
+            'customer',
+            text,
+            makeReadableTurnKey(
+              'customer',
+              turnId
+            )
+          );
+
+          customerTurnBuffer =
+            '';
         }
 
         function clearCustomerTurnTimer() {
@@ -1030,6 +1542,43 @@ fastify.register(
           }
 
           customerTurnTimer =
+            null;
+        }
+
+        function clearCallbackContinuationTimer() {
+          if (
+            callbackContinuationTimer
+          ) {
+            clearTimeout(
+              callbackContinuationTimer
+            );
+          }
+
+          callbackContinuationTimer =
+            null;
+        }
+
+        function clearAiTimers() {
+          if (
+            silenceMonitor
+          ) {
+            clearInterval(
+              silenceMonitor
+            );
+          }
+
+          if (
+            callbackOfferTimer
+          ) {
+            clearTimeout(
+              callbackOfferTimer
+            );
+          }
+
+          silenceMonitor =
+            null;
+
+          callbackOfferTimer =
             null;
         }
 
@@ -1086,6 +1635,16 @@ fastify.register(
 
           clearCustomerTurnTimer();
 
+          clearCallbackContinuationTimer();
+
+          if (
+            assistantReadableTimer
+          ) {
+            clearTimeout(
+              assistantReadableTimer
+            );
+          }
+
           if (
             waitForFinalTranscript &&
             openAiWs.readyState ===
@@ -1096,9 +1655,38 @@ fastify.register(
             );
           }
 
+          savePendingCustomerReadableTurn();
+
+          finalizeAssistantReadableTurn();
+
+          flushPendingReadableTurns();
+
           await flushTranscript();
 
           await transcriptSaveChain;
+
+          await readableTranscriptSaveChain;
+
+          if (
+            currentJobNumber
+          ) {
+            try {
+              await finalizeReadableTranscript(
+                currentJobNumber
+              );
+
+              console.log(
+                `Readable transcript finalized: Job #${currentJobNumber}`
+              );
+            } catch (
+              error
+            ) {
+              console.error(
+                'Readable transcript finalize error:',
+                error
+              );
+            }
+          }
 
           console.log(
             `Closing call resources: ${reason}`
@@ -1175,14 +1763,23 @@ fastify.register(
 
           clearCustomerTurnTimer();
 
+          clearCallbackContinuationTimer();
+
           try {
+            savePendingCustomerReadableTurn();
+
+            finalizeAssistantReadableTurn();
+
+            flushPendingReadableTurns();
+
             await flushTranscript();
 
             await transcriptSaveChain;
 
+            await readableTranscriptSaveChain;
+
             await updateTwilioCall(
               currentCallSid,
-
               {
                 Status:
                   'completed',
@@ -1323,7 +1920,10 @@ fastify.register(
           }
         }
 
-        async function startOwnerTransfer() {
+        async function startOwnerTransfer(
+          reason =
+            'customer-request'
+        ) {
           if (
             transferInProgress ||
             twilioHangupRequested ||
@@ -1341,15 +1941,24 @@ fastify.register(
 
           clearCustomerTurnTimer();
 
+          clearCallbackContinuationTimer();
+
           try {
+            finalizeAssistantReadableTurn();
+
+            flushPendingReadableTurns();
+
             await flushTranscript();
 
             await transcriptSaveChain;
 
+            await readableTranscriptSaveChain;
+
             const transferResultUrl =
               `${currentPublicBaseUrl}/transfer-result` +
               `?started=${encodeURIComponent(callStartMs)}` +
-              `&from=${encodeURIComponent(currentCallerPhone || '')}`;
+              `&from=${encodeURIComponent(currentCallerPhone || '')}` +
+              `&reason=${encodeURIComponent(reason)}`;
 
             const ownerScreenUrl =
               `${currentPublicBaseUrl}/owner-screen?parent=` +
@@ -1364,17 +1973,14 @@ fastify.register(
     timeout="20"
     action="${escapeXml(transferResultUrl)}"
     method="POST">
-
     <Number
       url="${escapeXml(ownerScreenUrl)}"
       method="POST">${escapeXml(OWNER_PHONE_NUMBER)}</Number>
-
   </Dial>
 </Response>`;
 
             await updateTwilioCall(
               currentCallSid,
-
               {
                 Twiml:
                   transferTwiml,
@@ -1382,7 +1988,7 @@ fastify.register(
             );
 
             console.log(
-              `Transfer started for ${currentCallSid}`
+              `Transfer started for ${currentCallSid} (${reason})`
             );
           } catch (
             error
@@ -1403,93 +2009,401 @@ fastify.register(
                 null,
 
               content:
-                "I'm sorry, I couldn't connect you right now. I'll make a note that you asked for a callback.",
+                "I'm sorry, I couldn't connect you right now. I've noted that you may need a callback.",
             });
 
             scheduleAiTimers();
           }
         }
 
-        async function applyServiceWindow(
+        function normalizeCrm(
+          crm = {}
+        ) {
+          const toText =
+            (
+              value
+            ) =>
+              typeof value ===
+                'string'
+                ? value.trim()
+                : '';
+
+          return {
+            customerName:
+              toText(
+                crm.customer_name
+              ),
+
+            preferredLanguage:
+              crm.preferred_language ||
+              'unknown',
+
+            category:
+              crm.category ||
+              'unknown',
+
+            problemSummary:
+              toText(
+                crm.problem_summary
+              ),
+
+            equipmentType:
+              toText(
+                crm.equipment_type
+              ),
+
+            urgency:
+              crm.urgency ||
+              'unknown',
+
+            serviceAddress:
+              toText(
+                crm.service_address
+              ),
+
+            serviceZip:
+              toText(
+                crm.service_zip
+              ),
+
+            callbackAtCallerNumber:
+              crm.callback_at_caller_number ===
+                'yes'
+                ? true
+                : crm.callback_at_caller_number ===
+                    'no'
+                  ? false
+                  : null,
+
+            callbackPhone:
+              toText(
+                crm.callback_phone
+              ),
+          };
+        }
+
+        function mergePendingCrm(
+          existing,
+          incoming
+        ) {
+          const result = {
+            ...(existing || {}),
+          };
+
+          for (
+            const [
+              key,
+              value,
+            ] of Object.entries(
+              incoming || {}
+            )
+          ) {
+            if (
+              value === true ||
+              value === false
+            ) {
+              result[key] =
+                value;
+            } else if (
+              typeof value ===
+                'string' &&
+              value &&
+              value !==
+                'unknown'
+            ) {
+              result[key] =
+                value;
+            }
+          }
+
+          return result;
+        }
+
+        async function applyCrmUpdate(
           decision
         ) {
-          let feeCents =
-            null;
+          const crm =
+            normalizeCrm(
+              decision.crm ||
+              {}
+            );
 
           if (
-            decision.service_window ===
-            'regular_95'
+            decision.requested_time_text
           ) {
-            feeCents =
-              9500;
+            crm.requestedTimeText =
+              decision.requested_time_text.trim();
           }
 
-          if (
-            decision.service_window ===
-            'off_hours_150'
-          ) {
-            feeCents =
-              15000;
-          }
+          const meaningful =
+            Object.fromEntries(
+              Object.entries(
+                crm
+              ).filter(
+                (
+                  [
+                    ,
+                    value,
+                  ]
+                ) =>
+                  value === true ||
+                  value === false ||
+                  (
+                    typeof value ===
+                      'string' &&
+                    value &&
+                    value !==
+                      'unknown'
+                  )
+              )
+            );
 
           if (
-            !feeCents
+            !Object.keys(
+              meaningful
+            ).length
           ) {
             return;
           }
 
-          lastServiceWindow =
-            decision.service_window;
+          if (
+            !currentJobNumber ||
+            !currentCustomerId
+          ) {
+            pendingCrm =
+              mergePendingCrm(
+                pendingCrm,
+                meaningful
+              );
+
+            return;
+          }
+
+          const signature =
+            JSON.stringify(
+              meaningful
+            );
+
+          if (
+            signature ===
+            lastCrmSignature
+          ) {
+            return;
+          }
+
+          try {
+            await updateCrmFromConversation({
+              jobNumber:
+                currentJobNumber,
+
+              customerId:
+                currentCustomerId,
+
+              ...meaningful,
+            });
+
+            lastCrmSignature =
+              signature;
+
+            const logParts =
+              [];
+
+            if (
+              meaningful.customerName
+            ) {
+              logParts.push(
+                `name=${meaningful.customerName}`
+              );
+            }
+
+            if (
+              meaningful.category
+            ) {
+              logParts.push(
+                `category=${meaningful.category}`
+              );
+            }
+
+            if (
+              meaningful.problemSummary
+            ) {
+              logParts.push(
+                `problem=${meaningful.problemSummary}`
+              );
+            }
+
+            if (
+              meaningful.equipmentType
+            ) {
+              logParts.push(
+                `equipment=${meaningful.equipmentType}`
+              );
+            }
+
+            if (
+              meaningful.serviceAddress
+            ) {
+              logParts.push(
+                `address=${meaningful.serviceAddress}`
+              );
+            }
+
+            if (
+              meaningful.serviceZip
+            ) {
+              logParts.push(
+                `zip=${meaningful.serviceZip}`
+              );
+            }
+
+            if (
+              meaningful.requestedTimeText
+            ) {
+              logParts.push(
+                `time=${meaningful.requestedTimeText}`
+              );
+            }
+
+            if (
+              meaningful.callbackAtCallerNumber ===
+              true
+            ) {
+              logParts.push(
+                'callback=same-number'
+              );
+            }
+
+            if (
+              meaningful.callbackAtCallerNumber ===
+              false
+            ) {
+              logParts.push(
+                'callback=do-not-use-caller-number'
+              );
+            }
+
+            if (
+              meaningful.callbackPhone
+            ) {
+              logParts.push(
+                `callbackPhone=${meaningful.callbackPhone}`
+              );
+            }
+
+            if (
+              meaningful.urgency
+            ) {
+              logParts.push(
+                `urgency=${meaningful.urgency}`
+              );
+            }
+
+            if (
+              meaningful.preferredLanguage
+            ) {
+              logParts.push(
+                `language=${meaningful.preferredLanguage}`
+              );
+            }
+
+            console.log(
+              `CRM updated: Job #${currentJobNumber}${logParts.length ? ` -> ${logParts.join(' | ')}` : ''}`
+            );
+          } catch (
+            error
+          ) {
+            console.error(
+              'CRM field update error:',
+              error
+            );
+          }
+        }
+
+        async function applyRequestedTime(
+          decision
+        ) {
+          const minutes =
+            decision.requested_time_minutes;
+
+          const feeCents =
+            getServiceFeeFromMinutes(
+              minutes
+            );
+
+          if (!feeCents) {
+            return;
+          }
+
+          lastRequestedTimeMinutes =
+            minutes;
 
           lastRequestedTimeText =
             decision.requested_time_text ||
             '';
 
-          const feeChanged =
-            currentServiceFeeCents !==
-            feeCents;
-
           if (
-            feeChanged
+            currentServiceFeeCents !==
+            feeCents
           ) {
             currentServiceFeeCents =
               feeCents;
 
-            pendingServiceFeeCents =
-              feeCents;
+            pendingServiceFee = {
+              feeCents,
+
+              requestedTimeMinutes:
+                minutes,
+
+              requestedTimeText:
+                lastRequestedTimeText,
+            };
 
             console.log(
-              `Service fee selected: $${feeCents / 100} (${decision.service_window})`
+              `Service fee selected: $${feeCents / 100} for ${lastRequestedTimeText || `${minutes} minutes after midnight`}`
             );
           }
 
           if (
             currentJobNumber &&
-            pendingServiceFeeCents ===
-              feeCents
+            (
+              pendingServiceFee ||
+              lastRequestedTimeText
+            )
           ) {
             try {
+              const update =
+                pendingServiceFee ||
+                {
+                  feeCents,
+
+                  requestedTimeMinutes:
+                    minutes,
+
+                  requestedTimeText:
+                    lastRequestedTimeText,
+                };
+
               await updateJobServiceFee({
                 jobNumber:
                   currentJobNumber,
 
                 serviceFeeCents:
-                  feeCents,
-
-                serviceWindow:
-                  decision.service_window,
+                  update.feeCents,
 
                 requestedTimeText:
-                  decision.requested_time_text ||
+                  update.requestedTimeText ||
                   null,
+
+                requestedTimeMinutes:
+                  update.requestedTimeMinutes,
               });
 
-              pendingServiceFeeCents =
-                null;
-
               console.log(
-                `CRM service fee updated: Job #${currentJobNumber} -> $${feeCents / 100}`
+                `CRM service fee updated: Job #${currentJobNumber} -> $${update.feeCents / 100}`
               );
+
+              pendingServiceFee =
+                null;
             } catch (
               error
             ) {
@@ -1511,19 +2425,18 @@ fastify.register(
             return;
           }
 
-          if (
-            ![
-              'regular_95',
-              'off_hours_150',
-            ].includes(
-              decision.service_window
-            )
-          ) {
+          const feeCents =
+            getServiceFeeFromMinutes(
+              decision
+                .requested_time_minutes
+            );
+
+          if (!feeCents) {
             return;
           }
 
           const key =
-            `${turnId}|${decision.service_window}|${decision.requested_time_text}`;
+            `${turnId}|${decision.requested_time_minutes}|${decision.requested_time_text}`;
 
           if (
             key ===
@@ -1536,12 +2449,10 @@ fastify.register(
             key;
 
           const content =
-            decision.service_window ===
-            'off_hours_150'
-
-              ? "That requested time is outside our regular service hours, so the service call is $150. If the technician does the repair, that $150 goes toward the cost of the work."
-
-              : "For that requested time, the service call is $95. If the technician does the repair, that $95 goes toward the cost of the work.";
+            feeCents ===
+            15000
+              ? 'That requested time is outside our regular service hours, so the service call is $150. If the technician does the repair, that $150 goes toward the cost of the work.'
+              : 'For that requested time, the service call is $95. If the technician does the repair, that $95 goes toward the cost of the work.';
 
           send({
             type:
@@ -1554,18 +2465,158 @@ fastify.register(
           });
         }
 
+        async function saveCallbackEvent(
+          eventType,
+          details = {}
+        ) {
+          if (
+            !currentJobNumber
+          ) {
+            console.error(
+              `Cannot save ${eventType}: Job is not ready`
+            );
+
+            return;
+          }
+
+          try {
+            await recordJobEvent(
+              currentJobNumber,
+              eventType,
+              details
+            );
+
+            console.log(
+              `CRM event saved: Job #${currentJobNumber} -> ${eventType}`
+            );
+          } catch (
+            error
+          ) {
+            console.error(
+              `CRM ${eventType} error:`,
+              error
+            );
+          }
+        }
+
+        async function acceptCallbackAndEnd(
+          decision
+        ) {
+          callbackOfferPending =
+            false;
+
+          callbackOfferDeclined =
+            false;
+
+          clearCallbackContinuationTimer();
+
+          await saveCallbackEvent(
+            'callback_requested',
+            {
+              reason:
+                'long_call_customer_agreed',
+
+              requestedAtMs:
+                Date.now(),
+
+              callerPhone:
+                currentCallerPhone,
+
+              routerReason:
+                decision.reason ||
+                null,
+            }
+          );
+
+          await speakAndEnd(
+            "Okay, I've noted that you're okay with a callback. Thank you. Have a good day.",
+            'callback-requested'
+          );
+        }
+
+        function startOneMinuteContinuation() {
+          callbackOfferPending =
+            false;
+
+          callbackOfferDeclined =
+            true;
+
+          clearCallbackContinuationTimer();
+
+          void saveCallbackEvent(
+            'callback_offer_declined',
+            {
+              reason:
+                'customer_wants_to_continue_now',
+
+              declinedAtMs:
+                Date.now(),
+            }
+          );
+
+          console.log(
+            'Customer declined callback; allowing one more minute'
+          );
+
+          callbackContinuationTimer =
+            setTimeout(
+              async () => {
+                if (
+                  shuttingDown ||
+                  twilioHangupRequested ||
+                  transferInProgress
+                ) {
+                  return;
+                }
+
+                console.log(
+                  'Extra one minute finished; transferring to owner'
+                );
+
+                const startedAt =
+                  Date.now();
+
+                send({
+                  type:
+                    'session.commentary.append',
+
+                  delegation_id:
+                    null,
+
+                  content:
+                    "Okay, I'll try to connect you with someone who can continue helping you.",
+                });
+
+                await waitForAssistantSpeechToFinish(
+                  startedAt,
+                  4000
+                );
+
+                await startOwnerTransfer(
+                  'callback-declined-timeout'
+                );
+              },
+
+              EXTRA_TIME_AFTER_CALLBACK_DECLINE_MS
+            );
+        }
+
         function buildRouterContext(
           currentTurnText
         ) {
           return `
 CURRENT CALL STATE:
 - Business timezone: ${BUSINESS_TIMEZONE}
+- Current server time: ${new Date().toISOString()}
 - Job: ${currentJobNumber ? `#${currentJobNumber}` : 'not ready yet'}
 - Transfer already in progress: ${transferInProgress ? 'yes' : 'no'}
 - Call ending already requested: ${twilioHangupRequested ? 'yes' : 'no'}
 - Current CRM service fee: $${currentServiceFeeCents / 100}
-- Last classified service window: ${lastServiceWindow}
-- Last requested time text: ${lastRequestedTimeText || '(none)'}
+- Latest requested time text: ${lastRequestedTimeText || '(none)'}
+- Latest requested time minutes after midnight: ${lastRequestedTimeMinutes}
+- callback_offer_pending: ${callbackOfferPending ? 'true' : 'false'}
+- callback_offer_declined: ${callbackOfferDeclined ? 'true' : 'false'}
+- Incoming caller number is already known by backend. Do not infer it into callback_phone unless caller explicitly gives an alternate number.
 
 CURRENT CUSTOMER TURN:
 ${currentTurnText || '(empty)'}
@@ -1587,9 +2638,40 @@ ${recentConversationText() || '(No transcript available yet.)'}
             )
           );
 
-          await applyServiceWindow(
+          // First persist semantic CRM information,
+          // then let deterministic fee logic
+          // force off-hours jobs to emergency if needed.
+          await applyCrmUpdate(
             decision
           );
+
+          await applyRequestedTime(
+            decision
+          );
+
+          if (
+            callbackOfferPending
+          ) {
+            if (
+              decision.callback_decision ===
+              'accept'
+            ) {
+              await acceptCallbackAndEnd(
+                decision
+              );
+
+              return;
+            }
+
+            if (
+              decision.callback_decision ===
+              'decline_continue'
+            ) {
+              startOneMinuteContinuation();
+
+              return;
+            }
+          }
 
           if (
             decision.action ===
@@ -1648,7 +2730,9 @@ ${recentConversationText() || '(No transcript available yet.)'}
               4000
             );
 
-            await startOwnerTransfer();
+            await startOwnerTransfer(
+              'semantic-human-request'
+            );
 
             return;
           }
@@ -1661,21 +2745,16 @@ ${recentConversationText() || '(No transcript available yet.)'}
 
             const reason =
               decision.intent ===
-              'suspected_scam'
-
+                'suspected_scam'
                 ? 'suspected-scam'
-
                 : decision.intent ===
-                  'unsolicited_sales'
-
-                ? 'unsolicited-sales'
-
-                : 'declined-call';
+                    'unsolicited_sales'
+                  ? 'unsolicited-sales'
+                  : 'declined-call';
 
             await speakAndEnd(
               decision.user_message ||
-              'Thanks for calling, but we cannot help with that request. Goodbye.',
-
+                'Thanks for calling, but we cannot help with that request. Goodbye.',
               reason
             );
 
@@ -1690,8 +2769,7 @@ ${recentConversationText() || '(No transcript available yet.)'}
 
             await speakAndEnd(
               decision.user_message ||
-              'Thanks for calling. Have a good day.',
-
+                'Thanks for calling. Have a good day.',
               'semantic-conversation-end'
             );
           }
@@ -1759,6 +2837,15 @@ ${recentConversationText() || '(No transcript available yet.)'}
 
           customerTurnBuffer =
             '';
+
+          queueReadableTurn(
+            'customer',
+            turnText,
+            makeReadableTurnKey(
+              'customer',
+              turnId
+            )
+          );
 
           routerChain =
             routerChain
@@ -1884,11 +2971,8 @@ ${recentConversationText() || '(No transcript available yet.)'}
 
           void speakAndEnd(
             "I'll go ahead and disconnect the call. Have a good day.",
-
             'silence-timeout',
-
             null,
-
             true
           );
         }
@@ -1903,32 +2987,33 @@ ${recentConversationText() || '(No transcript available yet.)'}
                 callStartMs
             );
 
-          const warningDelay =
-            MAX_CALL_WARNING_MS -
-            elapsed;
-
-          const closingDelay =
-            MAX_CALL_CLOSING_MS -
-            elapsed;
-
-          const hardDelay =
-            MAX_AI_CALL_MS -
+          const callbackOfferDelay =
+            CALLBACK_OFFER_MS -
             elapsed;
 
           if (
-            warningDelay >
+            callbackOfferDelay >
             0
           ) {
-            maxWarningTimer =
+            callbackOfferTimer =
               setTimeout(
                 () => {
                   if (
                     transferInProgress ||
                     shuttingDown ||
-                    twilioHangupRequested
+                    twilioHangupRequested ||
+                    callbackOfferPending ||
+                    callbackOfferDeclined
                   ) {
                     return;
                   }
+
+                  callbackOfferPending =
+                    true;
+
+                  console.log(
+                    'Long-call callback offer sent'
+                  );
 
                   send({
                     type:
@@ -1938,57 +3023,30 @@ ${recentConversationText() || '(No transcript available yet.)'}
                       null,
 
                     content:
-                      "We're almost at the end of the call. Is there anything else you need?",
+                      'I have another call coming in. Would it be okay if we call you back a little later?',
                   });
                 },
-                warningDelay
+
+                callbackOfferDelay
               );
-          }
-
-          if (
-            closingDelay >
-            0
+          } else if (
+            !callbackOfferPending &&
+            !callbackOfferDeclined
           ) {
-            maxClosingTimer =
-              setTimeout(
-                () => {
-                  if (
-                    transferInProgress ||
-                    shuttingDown ||
-                    twilioHangupRequested
-                  ) {
-                    return;
-                  }
+            callbackOfferPending =
+              true;
 
-                  void speakAndEnd(
-                    "I'll go ahead and disconnect the call now. Have a good day.",
+            send({
+              type:
+                'session.commentary.append',
 
-                    'three-minute-limit'
-                  );
-                },
-                closingDelay
-              );
+              delegation_id:
+                null,
+
+              content:
+                'I have another call coming in. Would it be okay if we call you back a little later?',
+            });
           }
-
-          if (
-            hardDelay <=
-            0
-          ) {
-            void endTwilioCall(
-              'three-minute-hard-limit'
-            );
-
-            return;
-          }
-
-          maxHardTimer =
-            setTimeout(
-              () =>
-                void endTwilioCall(
-                  'three-minute-hard-limit'
-                ),
-              hardDelay
-            );
 
           silenceMonitor =
             setInterval(
@@ -2084,7 +3142,7 @@ ${recentConversationText() || '(No transcript available yet.)'}
                   if (
                     now -
                       silenceWaitStartedAt >=
-                    SILENCE_HANGUP_MS
+                      SILENCE_HANGUP_MS
                   ) {
                     startSilenceClosing();
                   }
@@ -2118,8 +3176,43 @@ ${recentConversationText() || '(No transcript available yet.)'}
                   startSilencePrompt();
                 }
               },
+
               250
             );
+        }
+
+        async function maybeHandleSpecialResume() {
+          if (
+            resumeActionHandled ||
+            resumeReason !==
+              'callback-timeout-transfer-unavailable' ||
+            !sessionReady ||
+            !currentJobNumber
+          ) {
+            return;
+          }
+
+          resumeActionHandled =
+            true;
+
+          await saveCallbackEvent(
+            'callback_requested',
+            {
+              reason:
+                'owner_unavailable_after_long_call_transfer',
+
+              requestedAtMs:
+                Date.now(),
+
+              callerPhone:
+                currentCallerPhone,
+            }
+          );
+
+          await speakAndEnd(
+            "I couldn't connect you right now. I've noted that you need a callback. Have a good day.",
+            'long-call-transfer-unavailable'
+          );
         }
 
         function startSession() {
@@ -2218,12 +3311,19 @@ ${recentConversationText() || '(No transcript available yet.)'}
                   openAiSessionId
                 );
 
+                if (
+                  resumeReason ===
+                  'callback-timeout-transfer-unavailable'
+                ) {
+                  void maybeHandleSpecialResume();
+
+                  return;
+                }
+
                 const firstLine =
                   resumeReason ===
                   'transfer-unavailable'
-
                     ? "Thanks for waiting. I couldn't connect you right now, but I can keep helping you."
-
                     : OPENING;
 
                 send({
@@ -2256,9 +3356,7 @@ ${recentConversationText() || '(No transcript available yet.)'}
               if (
                 event.type ===
                   'session.output_audio.delta' &&
-
                 streamSid &&
-
                 connection.readyState ===
                   WebSocket.OPEN
               ) {
@@ -2289,6 +3387,10 @@ ${recentConversationText() || '(No transcript available yet.)'}
                   event.delta
                 );
 
+                // A customer speaking means the previous Mia turn
+                // is finished, even if the customer interrupted her.
+                finalizeAssistantReadableTurn();
+
                 lastCustomerTranscriptAt =
                   Date.now();
 
@@ -2305,15 +3407,11 @@ ${recentConversationText() || '(No transcript available yet.)'}
 
                 queueTranscript(
                   'customer',
-
                   event.delta,
-
                   event.start_ms ??
                     null,
-
                   event.end_ms ??
                     null,
-
                   event.event_id ??
                     null
                 );
@@ -2348,13 +3446,22 @@ ${recentConversationText() || '(No transcript available yet.)'}
                   event.delta
                 );
 
+                // If Mia starts answering before the customer debounce expires,
+                // the customer's readable turn is complete.
+                if (
+                  customerTurnBuffer.trim()
+                ) {
+                  finalizeCustomerTurn(
+                    'assistant-response-start'
+                  );
+                }
+
                 lastAssistantTranscriptAt =
                   Date.now();
 
                 if (
                   silencePhase ===
                     'prompting' &&
-
                   lastAssistantTranscriptAt >=
                     silencePromptSentAt
                 ) {
@@ -2367,15 +3474,11 @@ ${recentConversationText() || '(No transcript available yet.)'}
 
                 queueTranscript(
                   'assistant',
-
                   event.delta,
-
                   event.start_ms ??
                     null,
-
                   event.end_ms ??
                     null,
-
                   event.event_id ??
                     null
                 );
@@ -2384,6 +3487,11 @@ ${recentConversationText() || '(No transcript available yet.)'}
                   'assistant',
                   event.delta
                 );
+
+                assistantReadableBuffer +=
+                  event.delta;
+
+                scheduleAssistantReadableTurn();
 
                 return;
               }
@@ -2453,9 +3561,7 @@ ${recentConversationText() || '(No transcript available yet.)'}
               if (
                 data.event ===
                   'media' &&
-
                 sessionReady &&
-
                 openAiWs.readyState ===
                   WebSocket.OPEN
               ) {
@@ -2472,7 +3578,7 @@ ${recentConversationText() || '(No transcript available yet.)'}
 
               if (
                 data.event ===
-                'start'
+                  'start'
               ) {
                 streamSid =
                   data.start.streamSid;
@@ -2505,9 +3611,7 @@ ${recentConversationText() || '(No transcript available yet.)'}
                   ) &&
                   parsedStart >
                     0
-
                     ? parsedStart
-
                     : Date.now();
 
                 resumeReason =
@@ -2548,6 +3652,9 @@ ${recentConversationText() || '(No transcript available yet.)'}
                         currentCallerPhone
                       );
 
+                    currentCustomerId =
+                      customer.id;
+
                     const job =
                       await createJobForCall({
                         customerId:
@@ -2560,47 +3667,82 @@ ${recentConversationText() || '(No transcript available yet.)'}
                     currentJobNumber =
                       job.job_number;
 
+                    flushPendingReadableTurns();
+
                     currentServiceFeeCents =
                       job.service_fee_cents ||
                       currentServiceFeeCents;
+
+                    lastRequestedTimeText =
+                      job.requested_time_text ||
+                      lastRequestedTimeText;
 
                     console.log(
                       `CRM job ready: #${job.job_number}`
                     );
 
                     if (
-                      pendingServiceFeeCents
+                      pendingCrm
                     ) {
-                      const feeToApply =
-                        pendingServiceFeeCents;
+                      try {
+                        await updateCrmFromConversation({
+                          jobNumber:
+                            currentJobNumber,
 
+                          customerId:
+                            currentCustomerId,
+
+                          ...pendingCrm,
+                        });
+
+                        console.log(
+                          `CRM pending fields applied: Job #${currentJobNumber}`
+                        );
+
+                        pendingCrm =
+                          null;
+                      } catch (
+                        error
+                      ) {
+                        console.error(
+                          'CRM pending field update error:',
+                          error
+                        );
+                      }
+                    }
+
+                    if (
+                      pendingServiceFee
+                    ) {
                       await updateJobServiceFee({
                         jobNumber:
                           currentJobNumber,
 
                         serviceFeeCents:
-                          feeToApply,
-
-                        serviceWindow:
-                          lastServiceWindow,
+                          pendingServiceFee
+                            .feeCents,
 
                         requestedTimeText:
-                          lastRequestedTimeText ||
+                          pendingServiceFee
+                            .requestedTimeText ||
                           null,
+
+                        requestedTimeMinutes:
+                          pendingServiceFee
+                            .requestedTimeMinutes,
                       });
 
-                      currentServiceFeeCents =
-                        feeToApply;
-
-                      pendingServiceFeeCents =
-                        null;
-
                       console.log(
-                        `CRM service fee updated after job creation: Job #${currentJobNumber} -> $${feeToApply / 100}`
+                        `CRM service fee updated after job creation: Job #${currentJobNumber} -> $${pendingServiceFee.feeCents / 100}`
                       );
+
+                      pendingServiceFee =
+                        null;
                     }
 
                     await flushTranscript();
+
+                    void maybeHandleSpecialResume();
                   }
                 } catch (
                   error
@@ -2616,7 +3758,7 @@ ${recentConversationText() || '(No transcript available yet.)'}
 
               if (
                 data.event ===
-                'stop'
+                  'stop'
               ) {
                 await shutdown(
                   'twilio-stop',
